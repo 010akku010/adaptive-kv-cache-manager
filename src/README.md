@@ -13,9 +13,10 @@ Review 1's 50–60% implementation target).
 | Cost-Benefit Decision Engine | `decision_engine.py` | ✅ Implemented + tested (extended, backward-compatible with the original committed version) |
 | Tier Placement Manager | `simulator.py` (`TierPlacementManager`) | ✅ Simulation-level implementation |
 | End-to-end synthetic simulator | `simulator.py` | ✅ Implemented |
-| Performance Monitor | — | ❌ Not yet implemented |
+| Performance Monitor | `performance_monitor.py` | ✅ Implemented + tested |
+| FIFO / LRU / MTDS-static baselines | `baselines.py` | ✅ Implemented + tested |
+| Comparison harness | `evaluate.py` | ✅ Implemented |
 | vLLM integration | — | ❌ Not yet implemented |
-| FIFO / LRU / MTDS baselines | — | ❌ Not yet implemented |
 
 ## How the pieces fit together
 
@@ -46,8 +47,11 @@ decision logic can be demonstrated and validated on its own before the
 # Run the full unit test suite (no external dependencies required)
 python -m unittest discover -s tests -v
 
-# Run the end-to-end synthetic demo
+# Run the end-to-end synthetic demo (our engine only)
 python -m src.simulator
+
+# Run the comparison harness: Ours vs FIFO vs LRU vs MTDS-static
+python -m src.evaluate
 ```
 
 The demo populates a synthetic GPU with randomized KV blocks until it hits
@@ -55,6 +59,24 @@ The demo populates a synthetic GPU with randomized KV blocks until it hits
 Placement pipeline on every GPU-resident block, printing each block's
 importance score, chosen action, and resulting Net Utility — followed by the
 before/after memory snapshot.
+
+`evaluate.py` runs the same synthetic workload through all four policies and
+reports hit ratio, average/P99 latency, and final GPU utilization side by
+side, using the Performance Monitor's metrics. All numbers come from the
+synthetic generator in `simulator.py`, not real inference traces — this is a
+methodology check ahead of vLLM integration, not yet a validated result.
+
+**Honest preliminary finding:** in the current default weight configuration,
+the adaptive engine drives GPU utilization *below* what FIFO/LRU/MTDS-static
+settle at, because it evaluates each block's Net Utility independently with
+no explicit "stop once utilization hits a target" rule the way classical
+FIFO/LRU eviction does — so it can keep evicting low-importance blocks even
+after pressure has eased. That's a real, useful thing to have found this
+early: it's exactly what the (still unbuilt) Adaptive Weight Tuner feedback
+loop is meant to correct, and it's worth stating plainly in the Review 1
+presentation rather than hiding it — a panel is more likely to trust a
+project that shows it found and understood a limitation than one with
+suspiciously perfect numbers.
 
 ## Design rationale (for the Review 1 presentation)
 
