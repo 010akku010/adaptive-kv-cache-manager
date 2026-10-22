@@ -1,7 +1,8 @@
 # Adaptive Multi-Tier KV Cache Manager — Core Modules
 
-Implementation status: foundation hardening (Step 1) complete; event-driven
-simulator, Adaptive Weight Tuner and vLLM integration are still to come.
+Implementation status: foundation hardening (Step 1) and the event-driven
+simulator (Step 2) are complete. The Adaptive Weight Tuner, cost formulas in a
+common unit (milliseconds) and vLLM integration are still to come.
 
 ## Modules in this package
 
@@ -18,9 +19,15 @@ simulator, Adaptive Weight Tuner and vLLM integration are still to come.
 | End-to-end synthetic demo | `simulator.py` | ✅ Implemented |
 | Performance Monitor | `performance_monitor.py` | ✅ Implemented + tested |
 | FIFO / LRU / MTDS-static baselines | `baselines.py` | ✅ Implemented + tested |
-| Comparison harness | `evaluate.py` | ✅ Implemented + tested |
+| Snapshot comparison harness (Review-1 demo) | `evaluate.py` | ✅ Implemented + tested |
+| Hardware cost model (KV size, PCIe, recompute) | `hardware.py` | ✅ Implemented + tested |
+| Request-trace generator (Poisson/bursty, Zipf) | `trace.py` | ✅ Implemented + tested |
+| Event-driven simulator | `eventsim.py` | ✅ Implemented + tested |
+| Metrics (TTFT percentiles, hit ratios, overheads) | `metrics.py` | ✅ Implemented + tested |
+| Policy adapters (Ours, FIFO, LRU, LRU+offload, MTDS-style) | `policies.py` | ✅ Implemented + tested |
+| Multi-workload, multi-seed experiment runner | `experiment.py` | ✅ Implemented |
 | Adaptive Weight Tuner | — | ❌ Not yet implemented |
-| Event-driven (time-evolving) simulator | — | ❌ Not yet implemented |
+| Cost formulas in milliseconds | — | ❌ Not yet implemented |
 | vLLM integration | — | ❌ Not yet implemented |
 
 ## How the pieces fit together
@@ -57,8 +64,12 @@ python -m unittest discover -s tests -v
 # Run the end-to-end synthetic demo (our engine only)
 python -m src.simulator
 
-# Run the comparison harness: Ours vs FIFO vs LRU vs MTDS-static
+# Snapshot comparison (old Review-1 harness): Ours vs FIFO vs LRU vs MTDS-static
 python -m src.evaluate
+
+# Event-driven experiment: 4 workloads x 5 policies x N seeds (about 1 minute per seed)
+python -m src.experiment --seeds 3 --out results/event_sim_3seeds.json
+python -m src.experiment --workloads zipf --seeds 5 --duration 200   # quicker
 ```
 
 All runs are deterministic: the workload uses a fixed seed and a fixed
@@ -78,36 +89,91 @@ simulated clock, so the output is identical every time.
 | Runs depended on `time.time()` | Injectable `Clock`; `ManualClock` makes runs reproducible |
 | Baselines were compared under different triggers/targets | Ours, FIFO and LRU share the same trigger and target |
 
-## Current results and how far to trust them
+## Event-driven simulator
 
-```
-POLICY            HIT RATIO   AVG(ms)   P99(ms)   GPU UTIL
-Ours (Adaptive)       0.908      9.14     80.00      0.691
-FIFO                  0.795     18.00     80.00      0.699
-LRU                   0.828     15.43     80.00      0.699
-MTDS-static           1.000     12.00     12.00      0.000
-```
+Unlike the snapshot harness (one decision on a frozen set of blocks), the event
+simulator replays a **policy-independent request trace** while time passes:
 
-These numbers show the *mechanics work* (all policies now shed to the same
-target and the engine no longer over-evicts). They are **not** yet evidence for
-the project's claims, for reasons we know and plan to fix:
+- **Workload.** A population of conversations; each request needs *all* of its
+  conversation's existing KV blocks plus a few new ones. Which conversation is hit
+  follows a Zipf law; arrivals are Poisson or bursty. The trace is generated once
+  per (workload, seed) and replayed identically against every policy, which removes
+  the old circularity (replayed accesses used to be derived from the same
+  `access_count` our own score reads).
+- **Physical costs.** A GPU hit is free. A CPU-resident block is swapped in over PCIe:
+  `setup + size / bandwidth`, queued behind other swap-ins on the same link. An
+  evicted block is recomputed: `tokens / prefill throughput`. Block size comes from
+  the model's real architecture (`2 × layers × KV heads × head dim × bytes`).
+- **Pinning.** A running request's blocks cannot be moved or evicted.
+- **Fairness.** All policies share the same platform behaviour: forced LRU eviction
+  when a policy frees too little, CPU-tier cleanup, and the "load vs recompute"
+  choice for CPU blocks. Ours, FIFO, LRU and LRU+offload share the same trigger
+  (85%) and target (70%).
+- **Baselines.** FIFO and LRU (eviction only), **LRU+offload** (LRU order but moves
+  victims to CPU: the fair tier-aware classical baseline), and **MTDS-style** (a
+  simplified static-threshold re-implementation of the base paper's *idea*, not of
+  the full MTDS system).
 
-1. **Circular workload.** The replayed requests are derived from each block's
-   `access_count`, the same quantity our importance score uses, so our engine is
-   partly graded on its own inputs. An independent, time-evolving request stream
-   is required (event-driven simulator milestone).
-2. **Flat latency model.** Latency is a constant per tier (2 / 12 / 80 ms) and
-   ignores block size and migration cost, so MIGRATE looks almost free. This is
-   why MTDS-static scores a "perfect" hit ratio: it moves every block to an
-   unbounded-in-practice CPU tier. Realistic transfer and recompute costs will
-   remove this artifact.
-3. **Our engine currently chooses EVICT for every victim.** With the present
-   cost formulas, MIGRATE never beats EVICT for cold blocks. The formulas mix
-   unitless importance with size-scaled terms and hand-picked constants; they
-   should be re-expressed in one currency (expected milliseconds of delay).
-   The Adaptive Weight Tuner is also not built yet, so weights are still static.
-4. **Single snapshot.** One decision cycle on one set of blocks, one seed.
-   Final claims need multiple workloads, many seeds and mean ± std reporting.
+## Current results (3 seeds, 400 s traces, modelled T4 + ~1B model)
+
+Reuse-request TTFT in ms (mean ± std over seeds) and share of block reads served
+without recomputation. Raw numbers: `results/event_sim_3seeds.json`.
+
+| Workload | Policy | TTFT P50 | TTFT P99 | GPU hit | Cache hit |
+|---|---|---|---|---|---|
+| zipf | Ours | 7.6 ± 0.2 | 161 ± 18 | 0.730 ± 0.021 | 0.982 |
+| zipf | LRU+offload | 8.3 ± 0.5 | 166 ± 8 | 0.674 ± 0.031 | 0.982 |
+| zipf | MTDS-style | 7.9 ± 0.3 | 187 ± 12 | 0.711 ± 0.027 | 0.975 |
+| zipf | LRU | 68.7 ± 13.9 | 630 ± 64 | 0.675 ± 0.032 | 0.675 |
+| zipf | FIFO | 123.8 ± 11.1 | 675 ± 15 | 0.546 ± 0.026 | 0.546 |
+| long_context | Ours | 18.9 ± 1.6 | 933 ± 170 | 0.389 ± 0.012 | 0.890 |
+| long_context | LRU+offload | 20.2 ± 1.8 | 976 ± 227 | 0.312 ± 0.015 | 0.891 |
+| long_context | LRU | 406 ± 27 | 1367 | 0.317 ± 0.019 | 0.317 |
+
+(`bursty` and `uniform` follow the same pattern; see the JSON.)
+
+### What these results do and do not show
+
+1. **Using the CPU tier is the big win.** Every policy that offloads instead of
+   evicting cuts P50 TTFT by roughly 5-20x versus FIFO/LRU, because swapping a
+   block in over PCIe (~0.05 ms) is far cheaper than recomputing it (~2.7 ms). This
+   is a property of the hardware model, and it is exactly the effect the base paper
+   exploits. It is **not** a contribution of our scoring.
+2. **Our engine keeps more blocks on the GPU than LRU+offload.** The GPU hit ratio
+   is higher in all 12 paired (workload, seed) comparisons, by 0.2 to 8 points, and
+   it moves about 18% less data over PCIe on `zipf`. This is the genuine, modest
+   advantage of importance-aware victim selection.
+3. **That does not yet translate into a reliable latency win.** TTFT differences
+   between Ours and LRU+offload have mixed signs across seeds and are within noise.
+   We should not claim a latency improvement over LRU+offload from these results.
+4. **`COMPRESS` is never chosen** (0 compressions in every run). With the current
+   formulas compression never beats eviction or migration, so one of the four
+   actions is effectively dead. The cost formulas mix unitless importance with
+   size-scaled terms and hand-picked constants; re-expressing everything in
+   milliseconds of expected delay (next step) should fix this, and the compression
+   path then needs a quality-loss model.
+5. **Weights are still static**: the Adaptive Weight Tuner is not built, so "adaptive"
+   currently describes the scoring, not a feedback loop.
+
+### Known simplifications (state these in the report)
+
+- No request queueing, batching or GPU compute contention, so there is **no
+  throughput metric** and TTFT excludes scheduling delay.
+- Memory freed by MIGRATE becomes available immediately (real systems free it when
+  the device-to-host copy finishes); offload time is tracked but kept off the request path.
+- Recomputing a block costs `tokens / prefill throughput` regardless of position.
+- All blocks are the same size; pools are scaled down (1 GB GPU / 4 GB CPU) so the
+  *ratio* of working set to GPU memory creates pressure while runs stay fast.
+- Bandwidth and throughput values are **assumed typical figures, not measurements**
+  (`hardware.py`); calibrate them on real hardware during vLLM integration.
+- The workload is a *model* of conversation reuse, not a replay of real traces.
+
+### Earlier snapshot harness (`evaluate.py`)
+
+Kept as a Review-1 demonstration of the decision logic on a frozen set of blocks.
+Its latency model is flat (2 / 12 / 80 ms per tier) and its replayed accesses derive
+from `access_count`, so its numbers should **not** be quoted as evidence; use the
+event-driven results above instead.
 
 ## Design rationale (for the Review presentation)
 

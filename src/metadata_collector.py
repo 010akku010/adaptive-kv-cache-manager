@@ -50,6 +50,9 @@ class KVBlock:
             compressing (e.g. quantizing) this block.
         compressed: Whether the block is currently stored in compressed
             form.
+        pin_count: Number of in-flight requests currently using this
+            block. A pinned block must not be moved, compressed or
+            evicted, because a running request is reading it.
     """
 
     block_id: str
@@ -61,6 +64,11 @@ class KVBlock:
     migration_cost_ms: float = 0.0
     compression_benefit_mb: float = 0.0
     compressed: bool = False
+    pin_count: int = 0
+
+    @property
+    def pinned(self) -> bool:
+        return self.pin_count > 0
 
     def touch(self, now: Optional[float] = None) -> None:
         """

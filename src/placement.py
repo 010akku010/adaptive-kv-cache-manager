@@ -20,6 +20,8 @@ Fallback rules (documented behaviour, covered by tests)
 * MIGRATE when the CPU tier has no room      -> executed as EVICT
 * COMPRESS on an already-compressed block    -> no-op (compress-once guard)
 * MIGRATE on a block that is not on the GPU  -> no-op
+* MIGRATE / COMPRESS / EVICT on a pinned block -> no-op (a running request
+  is reading it)
 Every result records the requested action, the executed action and the
 reason for any deviation, so nothing is silently swallowed.
 """
@@ -82,6 +84,9 @@ class TierPlacementManager:
 
         if action == "KEEP":
             return result("KEEP")
+
+        if block.pinned:
+            return result("KEEP", "pinned")
 
         if action == "MIGRATE":
             if block.location != Tier.GPU:

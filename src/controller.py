@@ -44,8 +44,9 @@ Everything is deterministic: ties are broken by block id.
 
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass
-from typing import List, Optional, Set
+from typing import List, Optional, Tuple
 
 from src.decision_engine import DecisionEngine
 from src.importance_engine import AdaptiveImportanceEngine
@@ -139,30 +140,34 @@ class PressureDrivenController:
             return []
 
         decisions: List[ControlDecision] = []
-        no_progress: Set[str] = set()  # blocks whose action was a no-op
-        gpu_block_count = sum(1 for _ in self.collector.blocks_in_tier(Tier.GPU))
-        # Every block can be acted on at most twice (compress, then
-        # migrate/evict), so this bound guarantees termination.
-        max_iterations = 2 * gpu_block_count + 1
 
-        for _ in range(max_iterations):
+        # Victim queue ordered by value density (lowest first). Pinned blocks
+        # (in use by a running request) are never candidates. Importance does
+        # not change within a step (the clock is fixed), so keys only need
+        # recomputing for a block whose size changed, i.e. one just compressed.
+        heap: List[Tuple[float, str]] = [
+            self._victim_key(b)
+            for b in self.collector.blocks_in_tier(Tier.GPU)
+            if not b.pinned
+        ]
+        heapq.heapify(heap)
+
+        while heap:
             if self.tracker.gpu_pressure() <= cfg.low_watermark:
                 break
             if cfg.max_actions_per_step is not None and len(decisions) >= cfg.max_actions_per_step:
                 break
 
-            candidates = [
-                b for b in self.collector.blocks_in_tier(Tier.GPU)
-                if b.block_id not in no_progress
-            ]
-            if not candidates:
-                break
-
-            victim = min(candidates, key=self._victim_key)
-            decision = self._relieve(victim)
+            _, block_id = heapq.heappop(heap)
+            block = self.collector.get(block_id)
+            decision = self._relieve(block)
             decisions.append(decision)
-            if decision.executed_action == "KEEP":
-                no_progress.add(victim.block_id)
+
+            # A compressed block stays on the GPU and can still be migrated or
+            # evicted later (compress-once means it is never compressed again).
+            # A no-op (KEEP) result is dropped so it cannot be selected again.
+            if decision.executed_action == "COMPRESS" and block.location == Tier.GPU:
+                heapq.heappush(heap, self._victim_key(block))
 
         if self.tracker.gpu_pressure() <= cfg.low_watermark:
             self._shedding = False
@@ -172,7 +177,7 @@ class PressureDrivenController:
     # Internals
     # ------------------------------------------------------------------
 
-    def _victim_key(self, block: KVBlock):
+    def _victim_key(self, block: KVBlock) -> Tuple[float, str]:
         """Lowest importance-per-MB first; block id breaks ties deterministically."""
         density = self.importance_engine.compute_importance(block) / max(block.size_mb, _MIN_SIZE_MB)
         return (density, block.block_id)

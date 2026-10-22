@@ -17,15 +17,16 @@ and GPU memory pressure.
 ```bash
 python -m unittest discover -s tests -v   # run the tests (no dependencies needed)
 python -m src.simulator                   # end-to-end demo of our engine
-python -m src.evaluate                    # compare Ours vs FIFO vs LRU vs MTDS-static
+python -m src.evaluate                    # snapshot comparison (Review-1 demo)
+python -m src.experiment --seeds 3        # event-driven experiment, all workloads and policies
 ```
 
 Requires Python 3.9+. Runs are deterministic.
 
 ## Status
 
-Core decision pipeline, pressure-driven controller, baselines and comparison
-harness are implemented and tested on a synthetic workload. Still in progress:
-event-driven simulator, Adaptive Weight Tuner, evaluation on realistic traces and
-vLLM integration. See [`src/README.md`](src/README.md) for the module map,
+Core decision pipeline, pressure-driven controller, baselines and an event-driven
+simulator (request traces, PCIe/recompute cost model, TTFT percentiles) are
+implemented and tested. Still in progress: Adaptive Weight Tuner, cost formulas in a
+common unit, evaluation on real traces and vLLM integration. See [`src/README.md`](src/README.md) for the module map,
 current results and their known limitations.
