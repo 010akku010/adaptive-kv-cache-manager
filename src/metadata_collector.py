@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Iterable, Optional
 
+from src.clock import Clock, SystemClock
+
 
 class Tier(str, Enum):
     """Physical location of a KV-cache block."""
@@ -60,9 +62,14 @@ class KVBlock:
     compression_benefit_mb: float = 0.0
     compressed: bool = False
 
-    def touch(self) -> None:
-        """Record a new access to this block (updates recency/frequency)."""
-        self.last_access = time.time()
+    def touch(self, now: Optional[float] = None) -> None:
+        """
+        Record a new access to this block (updates recency/frequency).
+
+        ``now`` lets callers (the MetadataCollector) supply the time from an
+        injected clock; it defaults to wall-clock time for standalone use.
+        """
+        self.last_access = now if now is not None else time.time()
         self.access_count += 1
 
     def age_seconds(self, now: Optional[float] = None) -> float:
@@ -82,8 +89,9 @@ class MetadataCollector:
     independently testable.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Optional[Clock] = None) -> None:
         self._blocks: Dict[str, KVBlock] = {}
+        self.clock: Clock = clock if clock is not None else SystemClock()
 
     def register_block(
         self,
@@ -97,9 +105,12 @@ class MetadataCollector:
         if block_id in self._blocks:
             raise ValueError(f"Block '{block_id}' is already registered")
 
+        now = self.clock.now()
         block = KVBlock(
             block_id=block_id,
             size_mb=size_mb,
+            created_at=now,
+            last_access=now,
             location=location,
             migration_cost_ms=migration_cost_ms,
             compression_benefit_mb=compression_benefit_mb,
@@ -110,7 +121,7 @@ class MetadataCollector:
     def record_access(self, block_id: str) -> KVBlock:
         """Update recency/frequency counters for an accessed block."""
         block = self._require(block_id)
-        block.touch()
+        block.touch(self.clock.now())
         return block
 
     def update_location(self, block_id: str, location: Tier) -> KVBlock:

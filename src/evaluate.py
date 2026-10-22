@@ -2,18 +2,28 @@
 evaluate.py
 
 Preliminary comparison harness: runs the SAME synthetic workload through
-four policies -- our adaptive Cost-Benefit Decision Engine, FIFO, LRU,
-and a simplified MTDS-style static-threshold baseline -- and reports
-hit ratio, latency percentiles, and final GPU utilization for each.
+four policies -- our adaptive Cost-Benefit Decision Engine (driven by the
+pressure controller), FIFO, LRU, and a simplified MTDS-style
+static-threshold baseline -- and reports hit ratio, latency percentiles,
+and final GPU utilization for each.
 
-This directly implements Zeroth Review roadmap steps 8-12 (baseline
-implementation + preliminary comparison) at the synthetic-simulation
-level, ahead of vLLM integration. All numbers below come from the
-synthetic workload generator in `src/simulator.py` -- they are a
-methodology demonstration, not yet a claim about real serving traces.
-That distinction matters for the eventual report: Part 4 of the
-literature review (evaluation methodology) is exactly about not
-overclaiming from a synthetic or unrepresentative benchmark.
+Fairness guarantees (new in this version)
+-----------------------------------------
+* All policies start from an identical workload built with a fixed clock,
+  so runs are fully reproducible.
+* All policies execute their actions through the *same*
+  ``TierPlacementManager`` (no duplicated execution code).
+* Ours, FIFO and LRU use the same trigger (start shedding at the high
+  watermark) and the same target (stop at the low watermark), so they
+  differ only in *which* blocks they pick and *what* they do with them.
+
+This is Zeroth Review roadmap steps 8-12 (baseline implementation +
+preliminary comparison) at the synthetic-simulation level, ahead of vLLM
+integration. All numbers come from the synthetic workload generator in
+`src/workload.py` -- a methodology demonstration, not yet a claim about
+real serving traces. Part 4 of the literature review (evaluation
+methodology) is exactly about not overclaiming from a synthetic or
+unrepresentative benchmark.
 
 Run with:
     python -m src.evaluate
@@ -21,115 +31,113 @@ Run with:
 
 from __future__ import annotations
 
-import random
-from typing import Dict, List
+from typing import Dict, List, Optional
 
-from src.baselines import BaselinePolicy, FIFOPolicy, LRUPolicy, MTDSStaticThresholdPolicy
+from src.baselines import (
+    BaselinePolicy,
+    FIFOPolicy,
+    LRUPolicy,
+    MTDSStaticThresholdPolicy,
+)
+from src.controller import ControllerConfig, PressureDrivenController
 from src.decision_engine import DecisionEngine
 from src.importance_engine import AdaptiveImportanceEngine, ImportanceWeights
 from src.memory_tracker import MemoryTracker
-from src.metadata_collector import MetadataCollector, KVBlock, Tier
+from src.metadata_collector import MetadataCollector, Tier
 from src.performance_monitor import PerformanceMonitor
-from src.simulator import SimulationConfig, build_synthetic_workload
+from src.placement import PlacementResult, TierPlacementManager
+from src.workload import SimulationConfig, load_blocks
 
 
-def _load_blocks(collector: MetadataCollector, tracker: MemoryTracker, config: SimulationConfig) -> None:
-    """Populate GPU with the same synthetic block set, up to target pressure."""
-    import time
-    now = time.time()
-    for spec in build_synthetic_workload(config):
-        block = collector.register_block(
-            block_id=spec["block_id"],
-            size_mb=spec["size_mb"],
-            migration_cost_ms=spec["migration_cost_ms"],
-            compression_benefit_mb=spec["compression_benefit_mb"],
-        )
-        block.last_access = now - spec["last_access_offset_s"]
-        block.access_count = spec["access_count"]
-        tracker.add_block(block)
-        if tracker.gpu_pressure() >= config.target_gpu_fill_ratio:
-            break
+def _record(monitor: PerformanceMonitor, result: PlacementResult) -> None:
+    monitor.record_decision(result.executed_action)
+    if result.was_fallback:
+        monitor.record_fallback()
 
 
-def _apply_action(collector: MetadataCollector, tracker: MemoryTracker, block: KVBlock, action: str) -> None:
-    """Same bookkeeping-only execution used by TierPlacementManager in simulator.py."""
-    if action == "KEEP":
-        return
-    if action == "MIGRATE":
-        tracker.move_block(block, Tier.CPU)
-    elif action == "COMPRESS":
-        new_size = max(0.0, block.size_mb - block.compression_benefit_mb)
-        tracker.remove_block(block)
-        block.compressed = True
-        block.size_mb = new_size
-        tracker.add_block(block)
-    elif action == "EVICT":
-        tracker.remove_block(block)
-        block.location = Tier.EVICTED
-
-
-def _simulate_access_trace(blocks: List[KVBlock], monitor: PerformanceMonitor, seed: int = 7) -> None:
+def _replay_access_trace(collector: MetadataCollector, monitor: PerformanceMonitor) -> None:
     """
     Replay simulated future requests against the post-decision block
     placement: each block is "requested" a number of times proportional
-    to its original access_count (hotter blocks get requested more),
-    and the monitor records the resulting latency based on wherever
-    that block ended up (GPU / CPU / EVICTED).
+    to its original access_count (hotter blocks get requested more), and
+    the monitor records the resulting latency based on wherever that
+    block ended up (GPU / CPU / EVICTED).
     """
-    rng = random.Random(seed)
-    for block in blocks:
-        num_requests = max(1, block.access_count // 5)
-        for _ in range(num_requests):
+    for block in collector.all_blocks():
+        for _ in range(max(1, block.access_count // 5)):
             monitor.record_access(block.location)
-    rng.shuffle(monitor.latencies_ms)  # order doesn't matter for percentiles; kept for realism
 
 
-def run_our_engine(config: SimulationConfig) -> Dict:
-    collector = MetadataCollector()
+def _setup(config: SimulationConfig):
+    clock = config.make_clock()
+    collector = MetadataCollector(clock=clock)
     tracker = MemoryTracker(config.gpu_capacity_mb, config.cpu_capacity_mb)
-    _load_blocks(collector, tracker, config)
-
-    importance_engine = AdaptiveImportanceEngine(weights=ImportanceWeights())
-    decision_engine = DecisionEngine()
-    monitor = PerformanceMonitor()
-
-    for block in list(collector.blocks_in_tier(Tier.GPU)):
-        values = importance_engine.compute_action_values(block, tracker.gpu_pressure())
-        action, _ = decision_engine.decide(values)
-        monitor.record_decision(action)
-        _apply_action(collector, tracker, block, action)
-
-    _simulate_access_trace(list(collector.all_blocks()), monitor)
-    return {"name": "Ours (Adaptive)", "summary": monitor.summary(), "final_state": tracker.snapshot()}
+    load_blocks(collector, tracker, config, clock)
+    return clock, collector, tracker, TierPlacementManager(collector, tracker), PerformanceMonitor()
 
 
-def run_baseline(policy: BaselinePolicy, config: SimulationConfig) -> Dict:
-    collector = MetadataCollector()
-    tracker = MemoryTracker(config.gpu_capacity_mb, config.cpu_capacity_mb)
-    _load_blocks(collector, tracker, config)
+def _finish(name: str, collector: MetadataCollector, tracker: MemoryTracker, monitor: PerformanceMonitor) -> Dict:
+    _replay_access_trace(collector, monitor)
+    return {"name": name, "summary": monitor.summary(), "final_state": tracker.snapshot()}
 
-    monitor = PerformanceMonitor()
+
+def run_our_engine(config: SimulationConfig, controller_config: Optional[ControllerConfig] = None) -> Dict:
+    clock, collector, tracker, placement, monitor = _setup(config)
+    controller = PressureDrivenController(
+        collector=collector,
+        tracker=tracker,
+        importance_engine=AdaptiveImportanceEngine(weights=ImportanceWeights(), clock=clock),
+        decision_engine=DecisionEngine(),
+        placement=placement,
+        config=controller_config,
+    )
+    initial_gpu_blocks = {b.block_id for b in collector.blocks_in_tier(Tier.GPU)}
+
+    acted = set()
+    for d in controller.step():
+        acted.add(d.block_id)
+        monitor.record_decision(d.executed_action)
+        if d.fallback_reason:
+            monitor.record_fallback()
+    for _ in initial_gpu_blocks - acted:
+        monitor.record_decision("KEEP")
+
+    return _finish("Ours (Adaptive)", collector, tracker, monitor)
+
+
+def run_baseline(
+    policy: BaselinePolicy,
+    config: SimulationConfig,
+    controller_config: Optional[ControllerConfig] = None,
+) -> Dict:
+    cc = controller_config or ControllerConfig()
+    _, collector, tracker, placement, monitor = _setup(config)
+
     gpu_blocks = list(collector.blocks_in_tier(Tier.GPU))
-    actions = policy.select_actions(gpu_blocks, tracker.gpu_pressure(), config.gpu_capacity_mb)
-
+    actions = policy.select_actions(
+        gpu_blocks,
+        tracker.gpu_pressure(),
+        config.gpu_capacity_mb,
+        target_pressure=cc.low_watermark,
+        trigger_pressure=cc.high_watermark,
+    )
     for block in gpu_blocks:
-        action = actions[block.block_id]
-        monitor.record_decision(action)
-        _apply_action(collector, tracker, block, action)
+        _record(monitor, placement.apply(block.block_id, actions[block.block_id]))
 
-    _simulate_access_trace(list(collector.all_blocks()), monitor)
-    return {"name": policy.name, "summary": monitor.summary(), "final_state": tracker.snapshot()}
+    return _finish(policy.name, collector, tracker, monitor)
 
 
-def run_comparison(config: SimulationConfig = None) -> List[Dict]:
+def run_comparison(
+    config: Optional[SimulationConfig] = None,
+    controller_config: Optional[ControllerConfig] = None,
+) -> List[Dict]:
     config = config or SimulationConfig()
-    results = [
-        run_our_engine(config),
-        run_baseline(FIFOPolicy(), config),
-        run_baseline(LRUPolicy(), config),
-        run_baseline(MTDSStaticThresholdPolicy(), config),
+    return [
+        run_our_engine(config, controller_config),
+        run_baseline(FIFOPolicy(), config, controller_config),
+        run_baseline(LRUPolicy(), config, controller_config),
+        run_baseline(MTDSStaticThresholdPolicy(), config, controller_config),
     ]
-    return results
 
 
 def print_comparison(results: List[Dict]) -> None:
@@ -142,9 +150,8 @@ def print_comparison(results: List[Dict]) -> None:
             f"{r['name']:<16}{s['hit_ratio']:>11.3f}{s['avg_latency_ms']:>10.2f}"
             f"{s['p99_latency_ms']:>10.2f}{fs['gpu_utilization']:>11.3f}"
         )
-        print(f"{'':<16}actions: {s['actions']}")
+        print(f"{'':<16}actions: {s['actions']}  fallbacks: {s['fallbacks']}")
 
 
 if __name__ == "__main__":
-    results = run_comparison()
-    print_comparison(results)
+    print_comparison(run_comparison())

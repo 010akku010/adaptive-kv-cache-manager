@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from src.metadata_collector import Tier
 
@@ -51,6 +51,7 @@ class PerformanceMonitor:
     latencies_ms: List[float] = field(default_factory=list)
     hits: int = 0
     misses: int = 0
+    fallbacks: int = 0  # actions executed differently than requested (e.g. CPU full)
     action_counts: Dict[str, int] = field(default_factory=lambda: {
         "KEEP": 0, "MIGRATE": 0, "COMPRESS": 0, "EVICT": 0,
     })
@@ -74,6 +75,10 @@ class PerformanceMonitor:
         """Record which action the Decision Engine (or baseline) chose."""
         self.action_counts[action] = self.action_counts.get(action, 0) + 1
 
+    def record_fallback(self) -> None:
+        """Record that an action had to be downgraded (e.g. MIGRATE -> EVICT)."""
+        self.fallbacks += 1
+
     def hit_ratio(self) -> float:
         total = self.hits + self.misses
         return self.hits / total if total else 0.0
@@ -93,7 +98,7 @@ class PerformanceMonitor:
     def average_latency_ms(self) -> float:
         return sum(self.latencies_ms) / len(self.latencies_ms) if self.latencies_ms else 0.0
 
-    def summary(self) -> Dict[str, float]:
+    def summary(self) -> Dict[str, Any]:
         """Single dict of everything the evaluation harness needs to report."""
         return {
             "requests": len(self.latencies_ms),
@@ -103,4 +108,5 @@ class PerformanceMonitor:
             "p90_latency_ms": round(self.percentile(90), 3),
             "p99_latency_ms": round(self.percentile(99), 3),
             "actions": dict(self.action_counts),
+            "fallbacks": self.fallbacks,
         }

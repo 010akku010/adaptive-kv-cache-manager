@@ -5,13 +5,27 @@ Tracks GPU and CPU memory capacity/usage so that the rest of the system
 knows how much headroom is available and how much "pressure" the GPU
 tier is currently under. GPU memory pressure is one of the five inputs
 to the Adaptive Importance Engine (Zeroth Review, Slide 8/10).
+
+Capacity is *enforced*: a block can only be placed in a tier that has
+room for it. Attempting to overfill a tier raises ``CapacityError`` and
+leaves the tracker's state unchanged, so callers (the Tier Placement
+Manager) can implement an explicit fallback such as "CPU is full, evict
+instead of migrating".
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 from src.metadata_collector import KVBlock, Tier
+
+# Tolerance for floating-point accumulation when comparing sizes (MB).
+_EPS_MB = 1e-6
+
+
+class CapacityError(RuntimeError):
+    """Raised when a block does not fit in the requested tier."""
 
 
 @dataclass
@@ -32,6 +46,10 @@ class TierState:
             return 0.0
         return min(1.0, self.used_mb / self.capacity_mb)
 
+    def can_fit(self, size_mb: float) -> bool:
+        """True if ``size_mb`` more megabytes fit within capacity."""
+        return self.used_mb + size_mb <= self.capacity_mb + _EPS_MB
+
 
 class MemoryTracker:
     """
@@ -51,11 +69,36 @@ class MemoryTracker:
             return self.cpu
         raise ValueError(f"No memory accounting for tier: {location}")
 
+    # ------------------------------------------------------------------
+    # Capacity queries
+    # ------------------------------------------------------------------
+
+    def can_fit(self, location: Tier, size_mb: float) -> bool:
+        """Whether ``size_mb`` fits in ``location`` right now. EVICTED always fits."""
+        if location == Tier.EVICTED:
+            return True
+        return self._tier_state(location).can_fit(size_mb)
+
+    # ------------------------------------------------------------------
+    # Mutations
+    # ------------------------------------------------------------------
+
     def add_block(self, block: KVBlock) -> None:
-        """Account for a block's memory footprint in its current tier."""
+        """
+        Account for a block's memory footprint in its current tier.
+
+        Raises:
+            CapacityError: if the block does not fit in its tier.
+        """
         if block.location == Tier.EVICTED:
             return
         state = self._tier_state(block.location)
+        if not state.can_fit(block.size_mb):
+            raise CapacityError(
+                f"Block '{block.block_id}' ({block.size_mb:.2f} MB) does not fit in "
+                f"{block.location.value}: {state.free_mb:.2f} MB free of "
+                f"{state.capacity_mb:.2f} MB"
+            )
         state.used_mb += block.size_mb
 
     def remove_block(self, block: KVBlock) -> None:
@@ -65,17 +108,46 @@ class MemoryTracker:
         state = self._tier_state(block.location)
         state.used_mb = max(0.0, state.used_mb - block.size_mb)
 
-    def move_block(self, block: KVBlock, new_location: Tier, new_size_mb: float = None) -> None:
+    def move_block(
+        self,
+        block: KVBlock,
+        new_location: Tier,
+        new_size_mb: Optional[float] = None,
+    ) -> None:
         """
         Move a block from its current tier to a new one, updating both
         tiers' usage. Optionally update its size at the same time (e.g.
-        a compress-then-place action).
+        a compress-then-place action, or an in-place resize when
+        ``new_location`` equals the current tier).
+
+        The move is atomic: if the destination cannot hold the block,
+        ``CapacityError`` is raised and nothing is modified.
         """
+        size = block.size_mb if new_size_mb is None else new_size_mb
+
+        if new_location != Tier.EVICTED:
+            dest = self._tier_state(new_location)
+            # Moving within the same tier first releases the old footprint.
+            reclaimed = block.size_mb if block.location == new_location else 0.0
+            if dest.used_mb - reclaimed + size > dest.capacity_mb + _EPS_MB:
+                raise CapacityError(
+                    f"Block '{block.block_id}' ({size:.2f} MB) does not fit in "
+                    f"{new_location.value}"
+                )
+
         self.remove_block(block)
         block.location = new_location
-        if new_size_mb is not None:
-            block.size_mb = new_size_mb
+        block.size_mb = size
         self.add_block(block)
+
+    def evict_block(self, block: KVBlock) -> None:
+        """Drop a block from whichever tier holds it (it must be recomputed later)."""
+        self.remove_block(block)
+        block.location = Tier.EVICTED
+
+    # ------------------------------------------------------------------
+    # Signals
+    # ------------------------------------------------------------------
 
     def gpu_pressure(self) -> float:
         """

@@ -23,16 +23,11 @@ the full pipeline.
 
 from __future__ import annotations
 
-from typing import Dict, Mapping, Tuple, Union
+from typing import Mapping, Tuple, Union
 
-try:
-    # Optional import: only needed when values are ActionEstimate objects.
-    from src.importance_engine import ActionEstimate
-except ImportError:  # pragma: no cover - keeps module usable standalone
-    ActionEstimate = None  # type: ignore
+from src.importance_engine import ActionEstimate
 
-
-ActionValue = Union[Mapping[str, float], "ActionEstimate"]
+ActionValue = Union[Mapping[str, float], ActionEstimate]
 
 
 class DecisionEngine:
@@ -42,7 +37,7 @@ class DecisionEngine:
         """Net Utility = Estimated Benefit - Estimated Cost."""
         return benefit - cost
 
-    def decide(self, actions: Dict[str, ActionValue]) -> Tuple[str, float]:
+    def decide(self, actions: Mapping[str, ActionValue]) -> Tuple[str, float]:
         """
         Choose the best action among the candidates.
 
@@ -59,7 +54,7 @@ class DecisionEngine:
         if not actions:
             raise ValueError("decide() requires at least one candidate action")
 
-        best_action = None
+        best_action: str = ""
         best_utility = float("-inf")
 
         for action, values in actions.items():
@@ -74,6 +69,6 @@ class DecisionEngine:
 
     @staticmethod
     def _unpack(values: ActionValue) -> Tuple[float, float]:
-        if ActionEstimate is not None and isinstance(values, ActionEstimate):
+        if isinstance(values, ActionEstimate):
             return values.benefit, values.cost
         return values["benefit"], values["cost"]

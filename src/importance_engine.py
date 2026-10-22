@@ -32,8 +32,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
+from src.clock import Clock, SystemClock
 from src.metadata_collector import KVBlock
 
 
@@ -77,8 +78,12 @@ class AdaptiveImportanceEngine:
         quality_loss_scale: float = 0.5,
         base_compress_cost: float = 0.05,
         reference_block_mb: float = 32.0,
+        clock: Optional[Clock] = None,
     ) -> None:
         self.weights = weights if weights is not None else ImportanceWeights()
+        # Injected clock: recency is computed against this, not time.time(),
+        # so simulation runs are reproducible.
+        self.clock: Clock = clock if clock is not None else SystemClock()
         self.recency_half_life_s = recency_half_life_s
         self.frequency_scale = frequency_scale
         self.recompute_penalty_scale = recompute_penalty_scale
@@ -106,7 +111,7 @@ class AdaptiveImportanceEngine:
         Chosen over a raw age value because it needs no dataset-wide max
         to stay bounded -- important for an online, per-block score.
         """
-        age = block.age_seconds()
+        age = block.age_seconds(self.clock.now())
         return math.exp(-age / self.recency_half_life_s)
 
     def frequency_score(self, block: KVBlock) -> float:
@@ -149,6 +154,7 @@ class AdaptiveImportanceEngine:
 
         Returns:
             A dict mapping action name -> ActionEstimate(benefit, cost).
+            ``COMPRESS`` is omitted for blocks that are already compressed.
         """
         importance = self.compute_importance(block)
         w = self.weights
@@ -179,12 +185,17 @@ class AdaptiveImportanceEngine:
         # COMPRESS: benefit is the memory freed by shrinking the block in
         # place; cost is a fixed processing overhead plus a quality-loss
         # penalty that scales with how important (hot) the block is.
-        compress = ActionEstimate(
-            benefit=w.compression_benefit
-            * (block.compression_benefit_mb / self.reference_block_mb if self.reference_block_mb > 0 else 0.0)
-            * (0.5 + 0.5 * gpu_pressure),
-            cost=self.base_compress_cost + (self.quality_loss_scale * importance),
-        )
+        # A block is compressed at most once: repeated lossy compression
+        # compounds quality loss, so COMPRESS is simply not a candidate for
+        # an already-compressed block.
+        compress = None
+        if not block.compressed:
+            compress = ActionEstimate(
+                benefit=w.compression_benefit
+                * (block.compression_benefit_mb / self.reference_block_mb if self.reference_block_mb > 0 else 0.0)
+                * (0.5 + 0.5 * gpu_pressure),
+                cost=self.base_compress_cost + (self.quality_loss_scale * importance),
+            )
 
         # EVICT: benefit is the full memory freed -- slightly more than
         # MIGRATE since there is no ongoing CPU-tier footprint; cost is
@@ -195,12 +206,10 @@ class AdaptiveImportanceEngine:
             cost=self.recompute_penalty_scale * importance,
         )
 
-        return {
-            "KEEP": keep,
-            "MIGRATE": migrate,
-            "COMPRESS": compress,
-            "EVICT": evict,
-        }
+        values = {"KEEP": keep, "MIGRATE": migrate, "EVICT": evict}
+        if compress is not None:
+            values["COMPRESS"] = compress
+        return values
 
     # ------------------------------------------------------------------
     # Helpers

@@ -2,10 +2,10 @@
 simulator.py
 
 A synthetic KV-cache simulation environment that wires together the
-four modules implemented so far:
+modules implemented so far:
 
     MetadataCollector -> MemoryTracker -> AdaptiveImportanceEngine
-        -> DecisionEngine -> (simulated Tier Placement Manager)
+        -> DecisionEngine -> PressureDrivenController -> TierPlacementManager
 
 This lets the group demonstrate the core decision logic end-to-end
 *before* vLLM integration, per the project roadmap: build and validate
@@ -20,135 +20,77 @@ Run directly for a demo:
 
 from __future__ import annotations
 
-import random
-import time
-from dataclasses import dataclass
-from typing import List
+from typing import Optional
 
+from src.controller import ControllerConfig, PressureDrivenController
 from src.decision_engine import DecisionEngine
 from src.importance_engine import AdaptiveImportanceEngine, ImportanceWeights
 from src.memory_tracker import MemoryTracker
 from src.metadata_collector import MetadataCollector, Tier
+from src.placement import TierPlacementManager
+from src.workload import SimulationConfig, build_synthetic_workload, load_blocks
+
+# Re-exported so existing imports (`from src.simulator import ...`) keep working.
+__all__ = [
+    "SimulationConfig",
+    "TierPlacementManager",
+    "build_synthetic_workload",
+    "run_simulation",
+]
 
 
-@dataclass
-class SimulationConfig:
-    num_blocks: int = 200
-    gpu_capacity_mb: float = 4096.0
-    cpu_capacity_mb: float = 16384.0
-    target_gpu_fill_ratio: float = 0.85
-    random_seed: int = 42
-
-
-class TierPlacementManager:
-    """
-    Executes a Decision Engine's action for a block. In this simulator
-    the "execution" is bookkeeping-only (updating MetadataCollector and
-    MemoryTracker); real GPU<->CPU tensor movement is out of scope until
-    vLLM integration.
-    """
-
-    def __init__(self, collector: MetadataCollector, tracker: MemoryTracker) -> None:
-        self.collector = collector
-        self.tracker = tracker
-
-    def apply(self, block_id: str, action: str) -> None:
-        block = self.collector.get(block_id)
-
-        if action == "KEEP":
-            return  # no-op
-
-        if action == "MIGRATE":
-            self.tracker.move_block(block, Tier.CPU)
-            self.collector.update_location(block_id, Tier.CPU)
-
-        elif action == "COMPRESS":
-            new_size = max(0.0, block.size_mb - block.compression_benefit_mb)
-            self.tracker.remove_block(block)
-            self.collector.mark_compressed(block_id, new_size)
-            self.tracker.add_block(block)
-
-        elif action == "EVICT":
-            self.tracker.remove_block(block)
-            self.collector.update_location(block_id, Tier.EVICTED)
-
-        else:
-            raise ValueError(f"Unknown action: {action}")
-
-
-def build_synthetic_workload(config: SimulationConfig) -> List[dict]:
-    """Generate randomized-but-reproducible synthetic block specs."""
-    rng = random.Random(config.random_seed)
-    now = time.time()
-    blocks = []
-    for i in range(config.num_blocks):
-        size_mb = rng.uniform(4.0, 64.0)
-        blocks.append(
-            {
-                "block_id": f"block-{i:03d}",
-                "size_mb": size_mb,
-                "last_access_offset_s": rng.uniform(0.0, 120.0),
-                "access_count": rng.randint(1, 30),
-                "migration_cost_ms": size_mb * rng.uniform(0.3, 0.8),
-                "compression_benefit_mb": size_mb * rng.uniform(0.2, 0.5),
-            }
-        )
-    return blocks
-
-
-def run_simulation(config: SimulationConfig = None) -> None:
+def run_simulation(
+    config: Optional[SimulationConfig] = None,
+    controller_config: Optional[ControllerConfig] = None,
+) -> None:
     config = config or SimulationConfig()
 
-    collector = MetadataCollector()
+    clock = config.make_clock()
+    collector = MetadataCollector(clock=clock)
     tracker = MemoryTracker(
         gpu_capacity_mb=config.gpu_capacity_mb,
         cpu_capacity_mb=config.cpu_capacity_mb,
     )
-    importance_engine = AdaptiveImportanceEngine(weights=ImportanceWeights())
-    decision_engine = DecisionEngine()
-    placement_manager = TierPlacementManager(collector, tracker)
+    importance_engine = AdaptiveImportanceEngine(weights=ImportanceWeights(), clock=clock)
+    controller = PressureDrivenController(
+        collector=collector,
+        tracker=tracker,
+        importance_engine=importance_engine,
+        decision_engine=DecisionEngine(),
+        placement=TierPlacementManager(collector, tracker),
+        config=controller_config,
+    )
 
-    # 1. Populate synthetic blocks until GPU reaches the target fill ratio.
-    now = time.time()
-    for spec in build_synthetic_workload(config):
-        block = collector.register_block(
-            block_id=spec["block_id"],
-            size_mb=spec["size_mb"],
-            migration_cost_ms=spec["migration_cost_ms"],
-            compression_benefit_mb=spec["compression_benefit_mb"],
-        )
-        block.last_access = now - spec["last_access_offset_s"]
-        block.access_count = spec["access_count"]
-        tracker.add_block(block)
-
-        if tracker.gpu_pressure() >= config.target_gpu_fill_ratio:
-            break
+    # 1. Populate synthetic blocks until the GPU reaches the target fill ratio.
+    load_blocks(collector, tracker, config, clock)
+    initial_gpu_blocks = sorted(b.block_id for b in collector.blocks_in_tier(Tier.GPU))
+    cfg = controller.config
 
     print(f"Loaded {len(collector)} blocks onto GPU.")
-    print(f"Initial state: {tracker.snapshot()}\n")
+    print(f"Initial state: {tracker.snapshot()}")
+    print(
+        f"Controller: start shedding at {cfg.high_watermark:.0%} GPU utilization, "
+        f"stop at {cfg.low_watermark:.0%}\n"
+    )
 
-    # 2. For every GPU-resident block, compute action values and decide.
+    # 2. One control cycle: shed pressure using cost-benefit decisions.
+    decisions = controller.step()
+    acted = {d.block_id: d for d in decisions}
+
     header = f"{'BLOCK':<12}{'SIZE(MB)':>10}{'IMPORTANCE':>12}{'ACTION':>12}{'NET UTILITY':>14}"
     print(header)
     print("-" * len(header))
-
-    for block in list(collector.blocks_in_tier(Tier.GPU)):
-        gpu_pressure = tracker.gpu_pressure()
-        action_values = importance_engine.compute_action_values(
-            block=block,
-            gpu_pressure=gpu_pressure,
-        )
-        action, utility = decision_engine.decide(action_values)
-        importance = importance_engine.compute_importance(block)
-
+    for d in decisions:
+        block = collector.get(d.block_id)
+        note = f"  (fallback: {d.fallback_reason})" if d.fallback_reason else ""
         print(
-            f"{block.block_id:<12}{block.size_mb:>10.1f}{importance:>12.3f}"
-            f"{action:>12}{utility:>14.4f}"
+            f"{d.block_id:<12}{block.size_mb:>10.1f}{d.importance:>12.3f}"
+            f"{d.executed_action:>12}{d.net_utility:>14.4f}{note}"
         )
 
-        placement_manager.apply(block.block_id, action)
-
-    print(f"\nFinal state: {tracker.snapshot()}")
+    kept = [bid for bid in initial_gpu_blocks if bid not in acted]
+    print(f"\n{len(decisions)} blocks acted on; {len(kept)} blocks kept untouched on GPU.")
+    print(f"Final state: {tracker.snapshot()}")
 
 
 if __name__ == "__main__":

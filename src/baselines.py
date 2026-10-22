@@ -23,7 +23,7 @@ forcing them into our per-block interface) keeps the comparison fair.
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from src.metadata_collector import KVBlock, Tier
 
@@ -39,7 +39,15 @@ class BaselinePolicy:
         gpu_pressure: float,
         gpu_capacity_mb: float,
         target_pressure: float = 0.7,
+        trigger_pressure: Optional[float] = None,
     ) -> Dict[str, str]:
+        """
+        ``trigger_pressure`` (optional) is the utilization at which shedding
+        begins; below it every block is kept. Setting it equal to the
+        controller's high watermark gives all policies the same trigger and
+        the same target, so the comparison is apples to apples. When
+        ``None`` the policy sheds whenever pressure exceeds the target.
+        """
         raise NotImplementedError
 
 
@@ -53,10 +61,11 @@ class FIFOPolicy(BaselinePolicy):
 
     name = "FIFO"
 
-    def select_actions(self, blocks, gpu_pressure, gpu_capacity_mb, target_pressure=0.7):
+    def select_actions(self, blocks, gpu_pressure, gpu_capacity_mb, target_pressure=0.7, trigger_pressure=None):
         return _evict_until_target(
             blocks, gpu_pressure, gpu_capacity_mb, target_pressure,
             sort_key=lambda b: b.created_at,  # oldest-created first
+            trigger_pressure=trigger_pressure,
         )
 
 
@@ -70,10 +79,11 @@ class LRUPolicy(BaselinePolicy):
 
     name = "LRU"
 
-    def select_actions(self, blocks, gpu_pressure, gpu_capacity_mb, target_pressure=0.7):
+    def select_actions(self, blocks, gpu_pressure, gpu_capacity_mb, target_pressure=0.7, trigger_pressure=None):
         return _evict_until_target(
             blocks, gpu_pressure, gpu_capacity_mb, target_pressure,
             sort_key=lambda b: b.last_access,  # least-recently-accessed first
+            trigger_pressure=trigger_pressure,
         )
 
 
@@ -94,7 +104,8 @@ class MTDSStaticThresholdPolicy(BaselinePolicy):
         self.migrate_threshold = migrate_threshold
         self.evict_threshold = evict_threshold
 
-    def select_actions(self, blocks, gpu_pressure, gpu_capacity_mb, target_pressure=0.7):
+    def select_actions(self, blocks, gpu_pressure, gpu_capacity_mb, target_pressure=0.7, trigger_pressure=None):
+        # MTDS's own thresholds define when it acts; trigger/target are ignored.
         if gpu_pressure >= self.evict_threshold:
             action = "EVICT"
         elif gpu_pressure >= self.migrate_threshold:
@@ -111,6 +122,7 @@ def _evict_until_target(
     gpu_capacity_mb: float,
     target_pressure: float,
     sort_key,
+    trigger_pressure: Optional[float] = None,
 ) -> Dict[str, str]:
     """
     Shared logic for queue-ordered eviction (FIFO/LRU): repeatedly evict
@@ -119,6 +131,8 @@ def _evict_until_target(
     """
     actions = {b.block_id: "KEEP" for b in blocks}
     if gpu_pressure <= target_pressure or gpu_capacity_mb <= 0:
+        return actions
+    if trigger_pressure is not None and gpu_pressure < trigger_pressure:
         return actions
 
     used_mb = gpu_pressure * gpu_capacity_mb

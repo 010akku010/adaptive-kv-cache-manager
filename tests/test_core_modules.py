@@ -13,7 +13,11 @@ import unittest
 
 from src.baselines import FIFOPolicy, LRUPolicy, MTDSStaticThresholdPolicy
 from src.decision_engine import DecisionEngine
-from src.importance_engine import ActionEstimate, AdaptiveImportanceEngine, ImportanceWeights
+from src.importance_engine import (
+    ActionEstimate,
+    AdaptiveImportanceEngine,
+    ImportanceWeights,
+)
 from src.memory_tracker import MemoryTracker
 from src.metadata_collector import MetadataCollector, Tier
 from src.performance_monitor import PerformanceMonitor
