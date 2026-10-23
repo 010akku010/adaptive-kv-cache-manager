@@ -23,6 +23,7 @@ For a block that must give up GPU memory, each action has
       expected_reads = reuse_scale x importance
       cost(EVICT)    = expected_reads x recompute_ms
       cost(MIGRATE)  = expected_reads x swap_in_ms        (only offered if the CPU has room)
+                     + cpu_price x MB                     (host memory is contended too)
       cost(COMPRESS) = expected_reads x (decompress_ms + quality_penalty_ms)
 
 * a **benefit**: the memory it frees, valued at the *shadow price* of GPU
@@ -30,6 +31,17 @@ For a block that must give up GPU memory, each action has
 
       price = w_pressure x pressure^k x recompute_ms_per_MB x price_multiplier
       benefit(action) = price x MB_freed
+
+The host tier has its own shadow price, ``cpu_price``, which rises with host
+utilisation exactly like the GPU's does. It matters because a block parked on
+the host is not free: when the host pool fills, the platform drops the
+least-recently-used host blocks and they must be recomputed later. A diagnosis
+of the default regime showed the loss this causes: a policy that compresses
+before offloading fits twice as many blocks on the host, suffers half the
+host evictions and recomputes less than one that offloads full-size blocks.
+Without ``cpu_price`` the engine treated MIGRATE as nearly free whenever the host
+had *any* room, and so filled it with blocks never read again. ``cpu_price``
+defaults to 0 (the earlier behaviour) so it can be ablated.
 
 Net Utility = benefit - cost, in milliseconds, exactly as in the project's
 design. KEEP is the zero point (benefit 0, cost 0): when memory is plentiful
@@ -119,6 +131,9 @@ class MsParams:
     price_multiplier: float = 2.0
     pressure_exponent: float = 2.0
     quality_penalty_ms: float = 0.5
+    # Value of host memory relative to GPU memory's recompute-based price scale.
+    # 0 disables the host shadow price (the engine's behaviour before it was added).
+    cpu_price_multiplier: float = 0.0
 
 
 class MsImportanceEngine(AdaptiveImportanceEngine):
@@ -133,6 +148,7 @@ class MsImportanceEngine(AdaptiveImportanceEngine):
         frequency_scale: float = 5.0,
         clock: Optional[Clock] = None,
         cpu_free_mb: Optional[Callable[[], float]] = None,
+        cpu_utilization: Optional[Callable[[], float]] = None,
     ) -> None:
         super().__init__(
             weights=weights,
@@ -146,6 +162,7 @@ class MsImportanceEngine(AdaptiveImportanceEngine):
         # Optional live view of free CPU memory: MIGRATE is only offered while
         # the host tier can take the block (otherwise it would be an EVICT).
         self._cpu_free_mb = cpu_free_mb
+        self._cpu_utilization = cpu_utilization
 
     # ------------------------------------------------------------------
     # Building blocks (each returns milliseconds or ms/MB)
@@ -163,6 +180,17 @@ class MsImportanceEngine(AdaptiveImportanceEngine):
             * (p ** self.params.pressure_exponent)
             * self.cost_model.recompute_ms_per_mb
             * self.params.price_multiplier
+        )
+
+    def cpu_price_ms_per_mb(self) -> float:
+        """Shadow price of host memory (ms per MB); 0 when disabled or unobservable."""
+        if self._cpu_utilization is None or self.params.cpu_price_multiplier <= 0.0:
+            return 0.0
+        u = max(0.0, min(1.0, self._cpu_utilization()))
+        return (
+            self.params.cpu_price_multiplier
+            * (u ** self.params.pressure_exponent)
+            * self.cost_model.recompute_ms_per_mb
         )
 
     def _cpu_has_room(self, block: KVBlock) -> bool:
@@ -187,7 +215,8 @@ class MsImportanceEngine(AdaptiveImportanceEngine):
         if self._cpu_has_room(block):
             values["MIGRATE"] = ActionEstimate(
                 benefit=price * block.size_mb,
-                cost=reads * w.migration_cost * cm.swap_in_ms(block),
+                cost=reads * w.migration_cost * cm.swap_in_ms(block)
+                + self.cpu_price_ms_per_mb() * block.size_mb,
             )
         if not block.compressed and block.compression_benefit_mb > 0.0:
             freed = w.compression_benefit * block.compression_benefit_mb
@@ -210,7 +239,9 @@ class MsImportanceEngine(AdaptiveImportanceEngine):
         size = max(block.size_mb, _MIN_MB)
         per_mb = [reads * cm.recompute_ms(block) / size]  # EVICT
         if self._cpu_has_room(block):
-            per_mb.append(reads * self.weights.migration_cost * cm.swap_in_ms(block) / size)
+            per_mb.append(
+                reads * self.weights.migration_cost * cm.swap_in_ms(block) / size + self.cpu_price_ms_per_mb()
+            )
         if not block.compressed and block.compression_benefit_mb > 0.0:
             freed = max(self.weights.compression_benefit * block.compression_benefit_mb, _MIN_MB)
             per_mb.append(reads * (cm.decompress_ms(block) + self.params.quality_penalty_ms) / freed)

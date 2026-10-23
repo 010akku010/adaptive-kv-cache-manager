@@ -151,6 +151,7 @@ class MsAdaptivePolicy:
             recency_tau_s=recency_tau_s,
             clock=ctx.clock,
             cpu_free_mb=lambda: ctx.tracker.cpu.free_mb,
+            cpu_utilization=lambda: ctx.tracker.cpu.utilization,
         )
         self.controller = PressureDrivenController(
             collector=ctx.collector,

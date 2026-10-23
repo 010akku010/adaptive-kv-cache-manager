@@ -185,3 +185,70 @@ class TestVictimScore(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHostMemoryPrice(unittest.TestCase):
+    """The host tier has a shadow price too (cpu_price_multiplier; 0 = disabled)."""
+
+    def engine(self, multiplier, utilization=1.0):
+        return make_engine(
+            cpu_free=lambda: 100.0,
+            params=MsParams(reuse_scale=2.0, price_multiplier=2.0, quality_penalty_ms=0.5,
+                            cpu_price_multiplier=multiplier),
+        )[:3], utilization
+
+    def build(self, multiplier, utilization=1.0):
+        engine, collector, clock = make_engine(
+            cpu_free=lambda: 100.0,
+            params=MsParams(reuse_scale=2.0, price_multiplier=2.0, quality_penalty_ms=0.5,
+                            cpu_price_multiplier=multiplier),
+        )
+        engine._cpu_utilization = lambda: utilization
+        return engine, collector, clock
+
+    def test_disabled_by_default_so_earlier_behaviour_is_unchanged(self):
+        self.assertEqual(MsParams().cpu_price_multiplier, 0.0)
+        engine, collector, _ = self.build(0.0)
+        self.assertEqual(engine.cpu_price_ms_per_mb(), 0.0)
+        v = engine.compute_action_values(hot_block(collector), 1.0)
+        self.assertAlmostEqual(v["MIGRATE"].cost, 2.0, places=3)
+
+    def test_price_rises_with_host_utilisation(self):
+        prices = []
+        for u in (0.0, 0.5, 0.9, 1.0):
+            engine, _, _ = self.build(1.0, utilization=u)
+            prices.append(engine.cpu_price_ms_per_mb())
+        self.assertEqual(prices, sorted(prices))
+        self.assertAlmostEqual(prices[0], 0.0)
+        self.assertAlmostEqual(prices[-1], 10.0)  # 1 x 1^2 x 10 ms/MB
+
+    def test_unobservable_host_gives_no_price(self):
+        engine, _, _ = make_engine(params=MsParams(cpu_price_multiplier=5.0))
+        self.assertEqual(engine.cpu_price_ms_per_mb(), 0.0)
+
+    def test_migrate_cost_includes_the_host_price(self):
+        engine, collector, _ = self.build(2.0)  # price 20 ms/MB at full host utilisation
+        v = engine.compute_action_values(hot_block(collector), 1.0)
+        self.assertAlmostEqual(v["MIGRATE"].cost, 2.0 + 20.0, places=3)
+
+    def test_expensive_host_pushes_hot_blocks_to_compress_and_cold_blocks_to_evict(self):
+        engine, collector, clock = self.build(2.0)
+        hot = engine.compute_action_values(hot_block(collector), 1.0)
+        hot.pop("KEEP")
+        self.assertEqual(DecisionEngine().decide(hot)[0], "COMPRESS")  # nets: migrate -2, compress 8, evict 0
+        cold = engine.compute_action_values(cold_block(collector, clock), 1.0)
+        cold.pop("KEEP")
+        self.assertEqual(DecisionEngine().decide(cold)[0], "EVICT")  # not worth parking on a full host
+
+    def test_cheap_host_still_prefers_migrate(self):
+        engine, collector, _ = self.build(2.0, utilization=0.1)  # price 0.2 ms/MB
+        v = engine.compute_action_values(hot_block(collector), 1.0)
+        v.pop("KEEP")
+        self.assertEqual(DecisionEngine().decide(v)[0], "MIGRATE")
+
+    def test_victim_score_accounts_for_the_host_price(self):
+        engine, collector, _ = self.build(2.0)
+        # migrate per MB = 2 + 20 = 22; compress per MB = 4 (cheapest); evict = 20.
+        self.assertAlmostEqual(engine.victim_score(hot_block(collector)), 4.0, places=3)
+        engine, collector, _ = self.build(0.0)
+        self.assertAlmostEqual(engine.victim_score(hot_block(collector)), 2.0, places=3)

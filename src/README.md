@@ -76,7 +76,7 @@ python -m src.evaluate
 python -m src.experiment --seeds 3 --out results/event_sim_3seeds.json
 python -m src.experiment --workloads zipf --seeds 5 --duration 200   # quicker
 
-# The full final evaluation (14 policies, two platform regimes, held-out seeds 0-4).
+# The full final evaluation (17 policies, two platform regimes, held-out seeds 0-4).
 # About 11 minutes per regime on 2 cores; run workloads in chunks if your shell has a time limit.
 python -m src.experiment --regime default      --set full --seeds 5 --jobs 2 --out results/full_default.json
 python -m src.experiment --regime host-starved --set full --seeds 5 --jobs 2 --out results/full_host_starved.json
@@ -139,9 +139,20 @@ expected_reads = reuse_scale × importance                  (importance from rec
 cost(EVICT)    = expected_reads × recompute_ms
 cost(MIGRATE)  = expected_reads × swap_in_ms               (only offered if the CPU has room)
 cost(COMPRESS) = expected_reads × (decompress_ms + quality_penalty_ms)
+               + host_price × MB                           (host memory is contended too; ablatable)
 benefit(a)     = price(GPU pressure) × MB freed by a       price = pressure² × recompute_ms/MB × multiplier
 Net Utility    = benefit − cost                             (KEEP is the zero point)
 ```
+
+**Host-memory shadow price.** A diagnosis of the default regime showed why the first
+millisecond engine compressed nothing there: with 4 GB of host memory MIGRATE looked almost
+free, so the host filled with blocks that were never read again, the platform then dropped
+the least-recently-used host blocks, and they had to be recomputed. The static ladder, which
+compresses before offloading, fits about twice as many blocks on the host and suffers about
+half the host evictions. `cpu_price_multiplier` (default 0 = off) charges MIGRATE
+`host_utilisation² × recompute_ms/MB × multiplier` per MB, mirroring the GPU price. It is an
+ablation: `Ours-ms+host+tuner` uses a multiplier of 2, picked on tuning seeds 100-102 (a
+sweep of 0.5-4; larger values made the engine compress most reads).
 
 Hardware terms come from `hardware.py`. Three knobs are *exchange rates*, not physical
 constants, and are exposed in `MsParams`: `reuse_scale`, `price_multiplier` and
@@ -196,6 +207,7 @@ and **host-starved** (512 MB host pool; offloading is no longer free).
 | Ladder 0.25 | 76.5 ± 11.4 | 72.7 ± 17.3 | 113.1 ± 3.8 | 321.1 ± 28.6 | 0.27 |
 | Ours-ms | 52.3 ± 5.0 | 67.9 ± 18.0 | 106.3 ± 4.4 | 284.8 ± 30.5 | 0.67 |
 | Ours-ms+tuner b=0.2 | 66.0 ± 8.1 | 75.0 ± 21.4 | 111.2 ± 3.6 | 317.4 ± 37.0 | 0.28 |
+| Ours-ms+host+tuner b=0.2 | 65.4 ± 4.6 | 71.3 ± 20.3 | 110.4 ± 4.7 | 306.8 ± 33.5 | 0.34 |
 
 **Default regime**
 
@@ -208,6 +220,7 @@ and **host-starved** (512 MB host pool; offloading is no longer free).
 | Ladder 0.25 | 11.4 ± 1.6 | 11.2 ± 2.0 | 25.3 ± 3.4 | 54.8 ± 14.8 | 0.23 |
 | Ours-ms | 15.2 ± 1.6 | 14.8 ± 2.7 | 44.3 ± 3.2 | 87.3 ± 21.1 | 0.00 |
 | Ours-ms+tuner b=0.2 | 15.2 ± 1.6 | 14.9 ± 2.8 | 44.3 ± 3.2 | 87.3 ± 21.1 | 0.00 |
+| Ours-ms+host+tuner b=0.2 | 14.6 ± 1.9 | 14.0 ± 2.5 | 26.5 ± 4.4 | 60.3 ± 21.5 | 0.30 |
 
 ![Latency vs compressed-read exposure](../results/figures/frontier_host-starved.png)
 
@@ -241,11 +254,17 @@ excludes zero (`python -m src.analysis`).
    example a budget of 0.1 gave 0.17 (zipf), 0.31 (bursty) and 0.16 (long_context).
    Compressed blocks stay lossy until evicted, so exposure lags the controller. A hard cap
    on compressed blocks would be needed for a guarantee.
-6. **With plentiful host memory the engine is statistically tied with `LRU+offload` and
-   compresses nothing, which leaves latency on the table.** The static ladder at about 23%
-   exposure is far faster there (for example `uniform` 25 vs 44 ms). Our MIGRATE cost
-   ignores that swapped-in blocks displace other GPU blocks and queue on PCIe. Adding that
-   cost is the most valuable next modelling improvement.
+6. **With plentiful host memory the engine without a host price compresses nothing and ties
+   `LRU+offload`; the host price fixes most of that.** With it, `Ours-ms+host+tuner b=0.2`
+   is significantly faster than `LRU+offload` on `uniform` (−18 ms) and `long_context`
+   (−27 ms), and at equal exposure it is within about 1-3% of the static ladder there. It
+   does **not** close the gap on `zipf` and `bursty`: there it is still about 3-4 ms (35-45%)
+   slower than the ladder at equal exposure. Our diagnosis is that the ladder keeps *cold*
+   blocks compressed on the GPU instead of moving them, which the per-block cost model does
+   not capture; we have not yet tested that. In the host-starved regime the host price is a
+   mixed bag (better on `long_context`, −14 ms vs the ladder; about equal elsewhere), so it
+   remains an ablation rather than the default. The multiplier was chosen on tuning seeds;
+   the held-out numbers above are a fair test of it.
 7. **The tuner's contribution is the quality budget, not extra speed.** With a budget of 1.0
    it never binds and equals the static engine. The watermark mechanism never triggered.
 

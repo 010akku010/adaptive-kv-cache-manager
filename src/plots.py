@@ -69,6 +69,7 @@ def plot_frontier(rows: Sequence[Row], regime: str, path: str) -> str:
     workloads = list(dict.fromkeys(r["workload"] for r in rows if r.get("regime", "") == regime))
     pols = policies_in(rows)
     tuned = [p for p in pols if p.startswith("Ours-ms+tuner")]
+    hosted = [p for p in pols if p.startswith("Ours-ms+host+tuner")]
     ladder = [p for p in pols if p.startswith("Ladder")]
 
     fig, axes = plt.subplots(1, len(workloads), figsize=(3.6 * len(workloads), 3.6), facecolor=SURFACE)
@@ -85,11 +86,16 @@ def plot_frontier(rows: Sequence[Row], regime: str, path: str) -> str:
         if base:
             lad = sorted(lad + [base])
         ours = series(tuned)
-        for pts, color, label in ((lad, LADDER, "Static ladder"), (ours, OURS, "Tuned engine")):
+        host = series(hosted)
+        for pts, color, label, dash in (
+            (lad, LADDER, "Static ladder", "-"),
+            (ours, OURS, "Tuned engine", "-"),
+            (host, OURS, "Tuned engine + host price", (0, (4, 2))),
+        ):
             if not pts:
                 continue
             xs, ys, es = zip(*pts)
-            ax.errorbar(xs, ys, yerr=es, color=color, linewidth=1.6, marker="o", markersize=4.5,
+            ax.errorbar(xs, ys, yerr=es, color=color, linewidth=1.6, linestyle=dash, marker="o", markersize=4.5,
                         markeredgecolor=SURFACE, markeredgewidth=1.0, capsize=0, elinewidth=0.8,
                         ecolor=color, label=label)
         if base:
@@ -100,7 +106,7 @@ def plot_frontier(rows: Sequence[Row], regime: str, path: str) -> str:
         ax.set_xlim(left=-0.03)
     axes[0].set_ylabel("mean TTFT, reused requests (ms)", fontsize=8, color=INK_2)
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False, fontsize=8, labelcolor=INK)
+    fig.legend(handles, labels, loc="lower center", ncol=4, frameon=False, fontsize=8, labelcolor=INK)
     fig.suptitle(
         f"Latency vs quality exposure ({regime} regime). Lower and to the left is better. "
         "Bars: std over seeds.",

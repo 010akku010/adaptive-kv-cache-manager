@@ -44,6 +44,7 @@ from collections import defaultdict
 from dataclasses import replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from src.costmodel import MsParams
 from src.eventsim import EventSimulator, SimConfig, SimResult
 from src.hardware import PROFILES
 from src.policies import (
@@ -79,6 +80,8 @@ REPORT_METRICS: Tuple[Tuple[str, str, str], ...] = (
 
 TUNER_BUDGETS = (0.1, 0.2, 0.4, 0.6, 1.0)
 LADDER_FRACTIONS = (0.25, 0.5, 1.0)
+HOST_PRICE_BUDGETS = (0.2, 0.4, 0.6)
+HOST_PRICE_MULTIPLIER = 2.0  # chosen on tuning seeds 100-102
 
 
 def full_policy_specs() -> List[PolicySpec]:
@@ -100,6 +103,15 @@ def full_policy_specs() -> List[PolicySpec]:
     specs += [
         ms_adaptive_spec(f"Ours-ms+tuner b={b:g}", tuner_config=TunerConfig(max_compressed_read_ratio=b))
         for b in TUNER_BUDGETS
+    ]
+    # Ablation: the same tuned engine with the host-memory shadow price switched on.
+    specs += [
+        ms_adaptive_spec(
+            f"Ours-ms+host+tuner b={b:g}",
+            params=MsParams(cpu_price_multiplier=HOST_PRICE_MULTIPLIER),
+            tuner_config=TunerConfig(max_compressed_read_ratio=b),
+        )
+        for b in HOST_PRICE_BUDGETS
     ]
     return specs
 

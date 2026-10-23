@@ -106,6 +106,7 @@ class TestFrontier(unittest.TestCase):
                 row("Ours-ms+tuner b=0.2", s, 70.0, 0.2),   # ladder at 0.2 would be 84
                 row("Ours-ms+tuner b=0.9", s, 45.0, 0.9),   # ladder at 0.9 would be 44
                 row("Ours-ms+tuner b=0.0", s, 100.0, -0.1),  # outside the ladder's range
+                row("Ours-ms+host+tuner b=0.2", s, 80.0, 0.2),  # host-price variant, own row
             ]
         return rows
 
@@ -132,6 +133,11 @@ class TestFrontier(unittest.TestCase):
         text = format_report(rows)
         self.assertIn("Ours-ms", text)
         self.assertIn("*", text)  # a clear win is flagged as significant
+
+    def test_host_price_variant_is_reported_as_its_own_row(self):
+        lines = format_frontier(self.rows(), "w", "r")
+        host = [line for line in lines if "Ours-ms+host+tuner" in line]
+        self.assertIn("-4.0", host[0])  # 80 ms vs the ladder's 84 ms at the same exposure
 
 
 if __name__ == "__main__":

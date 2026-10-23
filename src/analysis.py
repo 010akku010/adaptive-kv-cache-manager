@@ -121,10 +121,10 @@ def policies_in(rows: Sequence[Row]) -> List[str]:
 
 
 def format_frontier(rows: Sequence[Row], workload: str, regime: str) -> List[str]:
-    """Our tuned engine vs the static ladder at equal compressed-read exposure."""
+    """Our tuned engines (with and without the host price) vs the static ladder at equal exposure."""
     all_p = policies_in(rows)
     ladder = [p for p in all_p if p.startswith("Ladder")] + ["LRU+offload"]  # LRU+offload = 0% exposure
-    ours = [p for p in all_p if p.startswith("Ours-ms+tuner")]
+    ours = [p for p in all_p if p.startswith("Ours-ms+tuner") or p.startswith("Ours-ms+host+tuner")]
     ladder_pts = frontier_points(rows, ladder, workload, regime)
     lines = []
     for p in ours:
@@ -135,10 +135,10 @@ def format_frontier(rows: Sequence[Row], workload: str, regime: str) -> List[str
             continue
         ref = interpolate(ladder_pts, x)
         if ref is None:
-            lines.append(f"  {p:<24} exposure {x:5.2f}  TTFT {y:7.1f} ms   (outside the ladder's range)")
+            lines.append(f"  {p:<26} exposure {x:5.2f}  TTFT {y:7.1f} ms   (outside the ladder's range)")
         else:
             lines.append(
-                f"  {p:<24} exposure {x:5.2f}  TTFT {y:7.1f} ms   ladder at same exposure {ref:7.1f} ms"
+                f"  {p:<26} exposure {x:5.2f}  TTFT {y:7.1f} ms   ladder at same exposure {ref:7.1f} ms"
                 f"   gap {y - ref:+7.1f} ms ({100 * (y - ref) / ref:+5.1f}%)"
             )
     return lines
@@ -149,7 +149,7 @@ def format_report(rows: Sequence[Row]) -> str:
     workloads = list(dict.fromkeys(r["workload"] for r in rows))
     pols = policies_in(rows)
     out: List[str] = []
-    candidates = ["Ours-ms", "Ours-ms+tuner b=0.2"]
+    candidates = ["Ours-ms", "Ours-ms+tuner b=0.2", "Ours-ms+host+tuner b=0.2"]
     baselines = ["Ours-v1", "LRU+offload", "MTDS-style", "Ladder 0.25"]
     for regime in regimes:
         for w in workloads:
@@ -165,7 +165,7 @@ def format_report(rows: Sequence[Row]) -> str:
                     except ValueError:
                         continue
                     sig = "*" if abs(m) > h else " "
-                    out.append(f"  {cand:<22} vs {base:<12} {m:+8.2f} ± {h:6.2f}  (n={n}) {sig}")
+                    out.append(f"  {cand:<26} vs {base:<12} {m:+8.2f} ± {h:6.2f}  (n={n}) {sig}")
             out.append("Tuned engine vs the static ladder at equal compressed-read exposure (interpolated):")
             out.extend(format_frontier(rows, w, regime) or ["  (no data)"])
     return "\n".join(out)
