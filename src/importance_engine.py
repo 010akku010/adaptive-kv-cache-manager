@@ -135,6 +135,15 @@ class AdaptiveImportanceEngine:
         raw = w.recency * self.recency_score(block) + w.frequency * self.frequency_score(block)
         return raw / total_weight
 
+    def victim_score(self, block: KVBlock) -> float:
+        """
+        Ranking key used by the pressure-driven controller: how much
+        keep-worth each MB of this block holds (importance per MB). The
+        block with the LOWEST score is shed first. Subclasses with a
+        richer cost model (see ``costmodel.MsImportanceEngine``) override it.
+        """
+        return self.compute_importance(block) / max(block.size_mb, 1e-6)
+
     # ------------------------------------------------------------------
     # Per-action benefit/cost estimation
     # ------------------------------------------------------------------

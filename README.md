@@ -19,6 +19,7 @@ python -m unittest discover -s tests -v   # run the tests (no dependencies neede
 python -m src.simulator                   # end-to-end demo of our engine
 python -m src.evaluate                    # snapshot comparison (Review-1 demo)
 python -m src.experiment --seeds 3        # event-driven experiment, all workloads and policies
+python -m src.analysis results/full_host_starved.json   # paired statistics on saved results
 ```
 
 Requires Python 3.9+. Runs are deterministic.
@@ -26,7 +27,8 @@ Requires Python 3.9+. Runs are deterministic.
 ## Status
 
 Core decision pipeline, pressure-driven controller, baselines and an event-driven
-simulator (request traces, PCIe/recompute cost model, TTFT percentiles) are
-implemented and tested. Still in progress: Adaptive Weight Tuner, cost formulas in a
-common unit, evaluation on real traces and vLLM integration. See [`src/README.md`](src/README.md) for the module map,
+simulator (request traces, PCIe/recompute cost model, TTFT percentiles), a cost model
+in milliseconds and an Adaptive Weight Tuner (quality-budget feedback loop) are
+implemented, tested and evaluated on held-out seeds with paired statistics. Still in
+progress: replay of real traces, a quality (accuracy) measurement and vLLM integration. See [`src/README.md`](src/README.md) for the module map,
 current results and their known limitations.

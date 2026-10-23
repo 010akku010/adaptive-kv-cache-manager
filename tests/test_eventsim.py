@@ -167,3 +167,55 @@ class TestEndToEndConsistency(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSignalsMatchMetrics(unittest.TestCase):
+    """The tuner's always-on counters must agree with the reporting metrics (warm-up off)."""
+
+    def _check(self, sim, result):
+        s, m = sim.signals, result.metrics
+        self.assertEqual(s.requests, m.requests)
+        self.assertEqual(s.gpu_hits, m.gpu_hits)
+        self.assertEqual(s.cpu_hits, m.cpu_hits)
+        self.assertEqual(s.recomputes, m.recomputes)
+        self.assertEqual(s.compressed_reads, m.compressed_reads)
+        self.assertEqual(s.forced_evictions, m.forced_evictions)
+        self.assertEqual(s.cpu_evictions, m.cpu_evictions)
+        self.assertEqual(s.oom_events, m.oom_events)
+        self.assertAlmostEqual(s.pcie_wait_ms, m.pcie_wait_ms, places=6)
+        self.assertEqual(s.accesses, m.accesses)
+
+    def test_counters_agree_on_hand_built_scenarios(self):
+        cases = [
+            (make_trace([req(0, 0.0), req(1, 1.0)], [3]), NULL_POLICY, toy_config()),
+            (make_trace([req(0, 0.0), req(1, 1.0)], [3]), MIGRATE_ALL, toy_config()),
+            (make_trace([req(0, 0.0), req(1, 1.0)], [3]), EVICT_ALL, toy_config()),
+            (make_trace([req(0, 0.0, new=0)], [4]), NULL_POLICY, toy_config(gpu_pool_mb=3.0)),  # OOM
+            (make_trace([req(0, 0.0, ctx=0, new=0), req(1, 1.0, ctx=1, new=0)], [2, 2]),
+             NULL_POLICY, toy_config(gpu_pool_mb=3.0)),  # forced eviction
+        ]
+        for trace, spec, cfg in cases:
+            with self.subTest(policy=spec.name, gpu=cfg.gpu_pool_mb):
+                sim, result = run(trace, spec, cfg)
+                self._check(sim, result)
+
+    def test_swap_ins_are_not_counted_as_oom(self):
+        # Regression: an OOM counter once fired on every CPU swap-in.
+        sim, result = run(make_trace([req(0, 0.0), req(1, 1.0)], [3]), MIGRATE_ALL)
+        self.assertGreater(result.metrics.cpu_hits, 0)
+        self.assertEqual(sim.signals.oom_events, 0)
+
+    def test_counters_agree_on_a_generated_workload(self):
+        cfg = SimConfig(gpu_pool_mb=64.0, cpu_pool_mb=128.0, warmup_s=0.0)
+        trace = generate_trace(WorkloadConfig(name="s", duration_s=40.0, num_contexts=30, seed=5))
+        for spec in default_policy_specs():
+            with self.subTest(policy=spec.name):
+                sim = EventSimulator(trace, cfg, spec)
+                self._check(sim, sim.run())
+
+    def test_reuse_gaps_are_recorded(self):
+        sim, _ = run(make_trace([req(0, 0.0), req(1, 5.0), req(2, 8.0)], [2]), NULL_POLICY)
+        gaps = sim.signals.reuse_gaps()
+        self.assertTrue(gaps)
+        self.assertTrue(all(g >= 0.0 for g in gaps))
+        self.assertIn(3.0, [round(g, 6) for g in gaps])  # the gap between t=5 and t=8

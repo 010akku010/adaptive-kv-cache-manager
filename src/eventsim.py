@@ -65,6 +65,7 @@ from src.metadata_collector import KVBlock, MetadataCollector, Tier
 from src.metrics import SimMetrics
 from src.placement import TierPlacementManager
 from src.policies import PolicyContext, PolicySpec
+from src.signals import Signals
 from src.trace import Request, Trace
 
 # Event kinds double as tie-break priority at equal timestamps.
@@ -122,6 +123,7 @@ class EventSimulator:
         self.tracker = MemoryTracker(config.gpu_pool_mb, config.cpu_pool_mb)
         self.placement = TierPlacementManager(self.collector, self.tracker)
         self.metrics = SimMetrics()
+        self.signals = Signals()  # always-on observations for the tuner (not gated by warm-up)
 
         self._requests_seen = 0
         self._block_seq = 0
@@ -137,6 +139,9 @@ class EventSimulator:
                 clock=self.clock,
                 block_mb=config.block_mb,
                 requests_seen=lambda: self._requests_seen,
+                signals=self.signals,
+                profile=config.profile,
+                block_tokens=config.block_tokens,
             )
         )
 
@@ -190,6 +195,7 @@ class EventSimulator:
         """Process a request; returns how long (seconds) it will hold its blocks."""
         cfg, prof, m = self.config, self.config.profile, self.metrics
         self._requests_seen += 1
+        self.signals.record_request()
         conv = self._conversations[req.context_id]
         is_reuse = conv.created
         pins: List[str] = []
@@ -202,6 +208,7 @@ class EventSimulator:
                 block.pin_count += 1  # pin first: nothing may move it mid-read
                 pins.append(bid)
                 access_ms += self._read_block(block, now, access_ms)
+                self.signals.record_reuse_gap(now - block.last_access)
                 self.collector.record_access(bid)
         else:
             conv.created = True
@@ -239,6 +246,7 @@ class EventSimulator:
 
         if block.location == Tier.GPU:
             m.record_gpu_hit(block.compressed)
+            self.signals.record_gpu_hit(block.compressed)
             return decompress_ms if block.compressed else 0.0
 
         if block.location == Tier.CPU:
@@ -253,8 +261,10 @@ class EventSimulator:
                 self.tracker.move_block(block, Tier.GPU)
             else:
                 m.record_oom()  # streamed through: pays the transfer, not cached
+                self.signals.record_oom()
             self._h2d_free_at = t + (wait_ms + xfer_ms) / 1000.0
             m.record_cpu_hit(block.size_mb, xfer_ms, wait_ms, was_compressed)
+            self.signals.record_cpu_hit(wait_ms, was_compressed)
             return wait_ms + xfer_ms + (decompress_ms if was_compressed else 0.0)
 
         return self._recompute_block(block)  # EVICTED
@@ -267,8 +277,10 @@ class EventSimulator:
             self.tracker.move_block(block, Tier.GPU)
         else:
             self.metrics.record_oom()
+            self.signals.record_oom()
         recompute_ms = prof.prefill_ms(cfg.block_tokens)
         self.metrics.record_recompute(recompute_ms)
+        self.signals.record_recompute()
         return recompute_ms
 
     def _reset_block(self, block: KVBlock) -> None:
@@ -293,6 +305,7 @@ class EventSimulator:
             self.tracker.move_block(block, Tier.GPU)
         else:
             self.metrics.record_oom()
+            self.signals.record_oom()
 
     # ------------------------------------------------------------------
     # Memory management helpers
@@ -324,6 +337,7 @@ class EventSimulator:
                 break
             self.placement.apply(block.block_id, "EVICT")
             self.metrics.record_forced_eviction()
+            self.signals.record_forced_eviction()
         return self.tracker.can_fit(Tier.GPU, size_mb)
 
     def _manage_cpu_tier(self) -> None:
@@ -340,6 +354,7 @@ class EventSimulator:
                 break
             self.placement.apply(block.block_id, "EVICT")
             self.metrics.record_cpu_eviction()
+            self.signals.record_cpu_eviction()
 
     # ------------------------------------------------------------------
     # Self-checks (used by the tests)

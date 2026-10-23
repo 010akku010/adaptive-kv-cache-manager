@@ -34,17 +34,21 @@ simulator so that every policy gets identical help.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Callable, List, Optional, Protocol
 
 from src.baselines import BaselinePolicy, FIFOPolicy, LRUPolicy
 from src.clock import Clock
 from src.controller import ControllerConfig, PressureDrivenController
+from src.costmodel import CostModel, MsImportanceEngine, MsParams
 from src.decision_engine import DecisionEngine
+from src.hardware import DEFAULT_PROFILE, ServingProfile
 from src.importance_engine import AdaptiveImportanceEngine, ImportanceWeights
 from src.memory_tracker import MemoryTracker
 from src.metadata_collector import MetadataCollector, Tier
 from src.placement import PlacementResult, TierPlacementManager
+from src.signals import Signals
+from src.tuner import AdaptiveWeightTuner, TunerConfig
 
 
 @dataclass
@@ -57,6 +61,9 @@ class PolicyContext:
     clock: Clock
     block_mb: float  # standard block size (MB)
     requests_seen: Callable[[], int]  # requests processed so far
+    signals: Signals = field(default_factory=Signals)  # always-on observations (see signals.py)
+    profile: ServingProfile = DEFAULT_PROFILE  # hardware model (for the millisecond cost model)
+    block_tokens: int = 16
 
 
 class CachePolicy(Protocol):
@@ -119,6 +126,66 @@ class AdaptivePolicy:
         ]
 
 
+class MsAdaptivePolicy:
+    """
+    The cost-benefit engine with every quantity in milliseconds
+    (``costmodel.MsImportanceEngine``), optionally with the Adaptive Weight
+    Tuner closing the feedback loop (``tuner.AdaptiveWeightTuner``).
+    """
+
+    def __init__(
+        self,
+        ctx: PolicyContext,
+        name: str,
+        weights: Optional[ImportanceWeights] = None,
+        params: Optional[MsParams] = None,
+        controller_config: Optional[ControllerConfig] = None,
+        tuner_config: Optional[TunerConfig] = None,
+        recency_tau_s: float = 30.0,
+    ) -> None:
+        self.name = name
+        engine = MsImportanceEngine(
+            cost_model=CostModel(ctx.profile, ctx.block_tokens),
+            params=params,
+            weights=weights,
+            recency_tau_s=recency_tau_s,
+            clock=ctx.clock,
+            cpu_free_mb=lambda: ctx.tracker.cpu.free_mb,
+        )
+        self.controller = PressureDrivenController(
+            collector=ctx.collector,
+            tracker=ctx.tracker,
+            importance_engine=engine,
+            decision_engine=DecisionEngine(),
+            placement=ctx.placement,
+            config=controller_config,
+        )
+        self.engine = engine
+        self.tuner: Optional[AdaptiveWeightTuner] = None
+        if tuner_config is not None:
+            self.tuner = AdaptiveWeightTuner(
+                engine=engine,
+                controller_config=self.controller.config,
+                signals=ctx.signals,
+                clock=ctx.clock,
+                config=tuner_config,
+            )
+
+    def relieve(self) -> List[PlacementResult]:
+        if self.tuner is not None:
+            self.tuner.maybe_step()
+        return [
+            PlacementResult(
+                block_id=d.block_id,
+                requested_action=d.requested_action,
+                executed_action=d.executed_action,
+                freed_gpu_mb=d.freed_gpu_mb,
+                fallback_reason=d.fallback_reason,
+            )
+            for d in self.controller.step()
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Classical baselines
 # ---------------------------------------------------------------------------
@@ -165,6 +232,68 @@ class QueuePolicy:
         for block in blocks:
             if actions[block.block_id] != "KEEP":
                 results.append(self.ctx.placement.apply(block.block_id, self.action))
+        return results
+
+
+class LadderPolicy:
+    """
+    Static, tier-aware baseline that uses ALL of our actions but with a fixed
+    rule instead of cost-benefit reasoning: LRU order, and a fixed ladder
+    "compress first, then offload".
+
+    When GPU pressure reaches the trigger, LRU blocks are compressed (frees
+    ``compression_savings`` of each block while keeping it on the GPU) until
+    the target is reached; if every candidate is already compressed and the
+    target is still not met, the least-recently-used blocks are offloaded to
+    CPU. It exists so that gains attributed to our engine are not just gains
+    from *having* compression available: this baseline has it too, but cannot
+    reason about which blocks deserve it. Compression here is unconditional,
+    so it ignores any accuracy budget.
+    """
+
+    name = "LRU+compress+offload"
+
+    def __init__(
+        self,
+        ctx: PolicyContext,
+        controller_config: Optional[ControllerConfig] = None,
+        max_compressed_fraction: float = 1.0,
+    ) -> None:
+        if not 0.0 <= max_compressed_fraction <= 1.0:
+            raise ValueError("max_compressed_fraction must be in [0, 1]")
+        self.ctx = ctx
+        self.config = controller_config or ControllerConfig()
+        # Static cap on the share of GPU-resident blocks that may be compressed.
+        # 1.0 = unconstrained; smaller values give a fixed quality budget, so the
+        # ladder can be compared with our engine at equal compressed-read exposure.
+        self.max_compressed_fraction = max_compressed_fraction
+
+    def relieve(self) -> List[PlacementResult]:
+        tracker, placement = self.ctx.tracker, self.ctx.placement
+        if tracker.gpu_pressure() < self.config.high_watermark:
+            return []
+        target = self.config.low_watermark
+        results: List[PlacementResult] = []
+        lru = sorted(
+            (b for b in self.ctx.collector.blocks_in_tier(Tier.GPU) if not b.pinned),
+            key=lambda b: (b.last_access, b.block_id),
+        )
+        resident = list(self.ctx.collector.blocks_in_tier(Tier.GPU))
+        compressed = sum(1 for b in resident if b.compressed)
+        cap = self.max_compressed_fraction * len(resident)
+        for block in lru:  # pass 1: compress (up to the static cap)
+            if tracker.gpu_pressure() <= target:
+                return results
+            if compressed >= cap:
+                break
+            if not block.compressed and block.compression_benefit_mb > 0.0:
+                results.append(placement.apply(block.block_id, "COMPRESS"))
+                compressed += 1
+        for block in lru:  # pass 2: offload (compressed blocks move smaller)
+            if tracker.gpu_pressure() <= target:
+                break
+            if block.location == Tier.GPU:
+                results.append(placement.apply(block.block_id, "MIGRATE"))
         return results
 
 
@@ -239,6 +368,27 @@ def adaptive_spec(
     return PolicySpec(name, lambda ctx: AdaptivePolicy(ctx, weights, controller_config, name))
 
 
+def ms_adaptive_spec(
+    name: str = "Ours-ms",
+    weights: Optional[ImportanceWeights] = None,
+    params: Optional[MsParams] = None,
+    controller_config: Optional[ControllerConfig] = None,
+    tuner_config: Optional[TunerConfig] = None,
+    recency_tau_s: float = 30.0,
+) -> PolicySpec:
+    """Millisecond cost model; pass ``tuner_config`` to enable the Adaptive Weight Tuner."""
+
+    def build(ctx: PolicyContext) -> CachePolicy:
+        # Fresh copies per run: the tuner mutates params and controller config in place.
+        return MsAdaptivePolicy(
+            ctx, name, weights, replace(params) if params else None,
+            replace(controller_config) if controller_config else None,
+            tuner_config, recency_tau_s,
+        )
+
+    return PolicySpec(name, build)
+
+
 def fifo_spec(controller_config: Optional[ControllerConfig] = None) -> PolicySpec:
     return PolicySpec("FIFO", lambda ctx: QueuePolicy(ctx, FIFOPolicy(), "EVICT", controller_config))
 
@@ -252,6 +402,14 @@ def lru_offload_spec(controller_config: Optional[ControllerConfig] = None) -> Po
         "LRU+offload",
         lambda ctx: QueuePolicy(ctx, LRUPolicy(), "MIGRATE", controller_config, name="LRU+offload"),
     )
+
+
+def ladder_spec(
+    controller_config: Optional[ControllerConfig] = None,
+    max_compressed_fraction: float = 1.0,
+    name: str = "LRU+compress+offload",
+) -> PolicySpec:
+    return PolicySpec(name, lambda ctx: LadderPolicy(ctx, controller_config, max_compressed_fraction))
 
 
 def mtds_spec(**kwargs: float) -> PolicySpec:

@@ -54,8 +54,6 @@ from src.memory_tracker import MemoryTracker
 from src.metadata_collector import KVBlock, MetadataCollector, Tier
 from src.placement import PlacementResult, TierPlacementManager
 
-_MIN_SIZE_MB = 1e-6  # avoids division by zero for fully compressed blocks
-
 
 @dataclass
 class ControllerConfig:
@@ -178,9 +176,8 @@ class PressureDrivenController:
     # ------------------------------------------------------------------
 
     def _victim_key(self, block: KVBlock) -> Tuple[float, str]:
-        """Lowest importance-per-MB first; block id breaks ties deterministically."""
-        density = self.importance_engine.compute_importance(block) / max(block.size_mb, _MIN_SIZE_MB)
-        return (density, block.block_id)
+        """Lowest victim score first (importance per MB by default); block id breaks ties."""
+        return (self.importance_engine.victim_score(block), block.block_id)
 
     def _relieve(self, block: KVBlock) -> ControlDecision:
         pressure_before = self.tracker.gpu_pressure()
