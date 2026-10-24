@@ -1,0 +1,226 @@
+<title>KV Cache Manager Demo</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* Layout: control strip on top, two policy panels side by side (stacked on phones), one shared latency chart, results table. */
+:root{
+  --bg:#fcfcfb; --panel:#f4f4f1; --ink:#0b0b0b; --ink2:#52514e; --ink3:#7b7a76; --grid:#e4e3df; --line:#d6d5d0;
+  --ours:#2a78d6; --base:#eb6834; --gpu:#2a78d6; --cpu:#8a8985; --comp:#eb6834; --warn:#b7791f;
+  --font:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif; --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#121211;--panel:#1b1b19;--ink:#f1f0ec;--ink2:#b3b2ac;--ink3:#86857f;--grid:#2c2c29;--line:#3a3a36;--ours:#5b9cf0;--base:#f08a5d;--gpu:#5b9cf0;--cpu:#9a9993;--comp:#f08a5d;--warn:#e0a84a;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#121211;--panel:#1b1b19;--ink:#f1f0ec;--ink2:#b3b2ac;--ink3:#86857f;--grid:#2c2c29;--line:#3a3a36;--ours:#5b9cf0;--base:#f08a5d;--gpu:#5b9cf0;--cpu:#9a9993;--comp:#f08a5d;--warn:#e0a84a;color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--font);font-size:14px;line-height:1.5;padding-block:20px 40px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.wrap{max-width:1100px;margin:0 auto;display:flex;flex-direction:column;gap:18px}
+h1{font-size:22px;font-weight:600;margin:0;text-wrap:balance}
+.sub{color:var(--ink2);margin:4px 0 0;max-width:70ch}
+.note{font-size:12px;color:var(--ink3);margin:0}
+.bar{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;padding:12px 14px;background:var(--panel);border-radius:6px}
+.seg{display:flex;gap:2px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:2px;flex-wrap:wrap}
+.seg button{border:0;background:transparent;color:var(--ink2);padding:6px 10px;border-radius:4px;font:inherit;cursor:pointer}
+.seg button[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
+button:focus-visible,input:focus-visible{outline:2px solid var(--ours);outline-offset:2px}
+.play{border:1px solid var(--line);background:var(--bg);color:var(--ink);border-radius:6px;padding:7px 14px;font:inherit;font-weight:600;cursor:pointer;min-width:84px}
+.scrub{flex:1 1 220px;min-width:0;display:flex;align-items:center;gap:10px}
+.scrub input{flex:1;min-width:0;accent-color:var(--ours)}
+.clock{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--ink2);white-space:nowrap}
+.panels{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media (max-width:760px){.panels{grid-template-columns:1fr}}
+.panel{background:var(--panel);border-radius:6px;padding:14px;min-width:0;display:flex;flex-direction:column;gap:12px}
+.panel h2{font-size:15px;margin:0;display:flex;align-items:center;gap:8px;font-weight:600}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+.panel p{margin:0;font-size:12px;color:var(--ink2)}
+.meter label{display:flex;justify-content:space-between;font-size:12px;color:var(--ink2);margin-bottom:3px;gap:8px}
+.meter label b{font-family:var(--mono);font-weight:500;color:var(--ink);font-variant-numeric:tabular-nums}
+.track{height:12px;background:var(--bg);border:1px solid var(--line);border-radius:3px;overflow:hidden;display:flex;gap:2px}
+.track i{display:block;height:100%}
+.blocks .track{height:16px}
+.legend{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:12px;color:var(--ink2);margin-top:6px}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.legend i{width:9px;height:9px;border-radius:2px;display:inline-block}
+.counts{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.counts div{background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:6px 8px;min-width:0}
+.counts small{display:block;font-size:11px;color:var(--ink3);text-transform:uppercase;letter-spacing:.05em}
+.counts b{font-family:var(--mono);font-size:15px;font-weight:500;font-variant-numeric:tabular-nums}
+.card{background:var(--panel);border-radius:6px;padding:14px;min-width:0}
+.card h3{margin:0 0 4px;font-size:14px;font-weight:600}
+svg{display:block;width:100%;height:auto;overflow:visible}
+svg text{fill:var(--ink2);font-family:var(--font);font-size:11px}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;min-width:520px;font-variant-numeric:tabular-nums}
+th,td{padding:7px 10px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{font-weight:500;color:var(--ink2);font-size:12px}
+.log{font-family:var(--mono);font-size:12px;color:var(--ink2);display:flex;flex-direction:column;gap:2px;min-height:7.5em}
+.log b{color:var(--ink);font-weight:500}
+.caveat{border-left:3px solid var(--warn);padding:6px 12px;color:var(--ink2);font-size:13px;max-width:80ch}
+.tbl-note{font-size:12px;color:var(--ink3);margin:8px 0 0}
+</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<div class="wrap">
+  <header>
+    <h1>Adaptive Multi-Tier KV Cache Manager</h1>
+    <p class="sub">Replay of the same request traffic against two policies. Watch how each one fills GPU memory, uses the CPU tier, and what that does to time-to-first-token (TTFT).</p>
+  </header>
+
+  <div class="bar" role="group" aria-label="Playback controls">
+    <div class="seg" id="scenarios" role="group" aria-label="Scenario"></div>
+    <button class="play" id="play" type="button">Pause</button>
+    <div class="seg" id="speeds" role="group" aria-label="Speed"></div>
+    <div class="scrub"><input id="scrub" type="range" min="0" max="0" value="0" aria-label="Simulated time"><span class="clock" id="clock">0 s</span></div>
+  </div>
+  <p class="note" id="scenarioNote"></p>
+
+  <div class="panels" id="panels"></div>
+
+  <section class="card">
+    <h3>Time to first token while it runs</h3>
+    <p class="note" id="chartNote">Rolling mean over 5 s, all requests. Lower is better. Click or drag the chart to jump.</p>
+    <svg id="chart" viewBox="0 0 900 260" role="img" aria-label="TTFT over time for both policies"></svg>
+  </section>
+
+  <section class="card">
+    <h3>What the engine just decided</h3>
+    <p class="note">Most recent decisions by the adaptive engine, up to the current time (a sample of at most six per second).</p>
+    <div class="log" id="log" aria-live="off"></div>
+  </section>
+
+  <section class="card">
+    <h3>Result for the whole run</h3>
+    <div class="scroll"><table id="results"></table></div>
+    <p class="tbl-note">TTFT is for requests that reuse an existing conversation, after warm-up.</p>
+  </section>
+
+  <p class="caveat" id="caveat"></p>
+  <p class="note">Simulated T4-class GPU serving a ~1B-parameter model. Speeds are assumed typical values, not measurements. Memory pools are scaled down (1 GB GPU) so pressure appears quickly.</p>
+</div>
+
+<script>
+const DATA = /*DATA*/null;
+const $ = (id) => document.getElementById(id);
+const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+let scen = 0, idx = 0, playing = true, speed = 4, acc = 0, last = 0;
+
+const SPEEDS = [1, 4, 10];
+$("speeds").innerHTML = SPEEDS.map(s => `<button type="button" data-s="${s}" aria-pressed="${s===speed}">${s}x</button>`).join("");
+$("scenarios").innerHTML = DATA.scenarios.map((s,i) => `<button type="button" data-i="${i}" aria-pressed="${i===0}">${s.label}</button>`).join("");
+
+function buildPanels() {
+  const runs = DATA.scenarios[scen].runs;
+  $("panels").innerHTML = runs.map((r, k) => {
+    const colour = k === 0 ? "var(--base)" : "var(--ours)";
+    const desc = k === 0 ? "Moves the oldest blocks to CPU memory when the GPU fills. Never compresses." : "Scores every block, then picks KEEP, MIGRATE, COMPRESS or EVICT by net utility.";
+    const name = k === 0 ? "LRU + offload (baseline)" : "Adaptive engine (ours)";
+    return `<article class="panel" data-k="${k}">
+      <h2><span class="dot" style="background:${colour}"></span>${name}</h2><p>${desc}</p>
+      <div class="meter"><label>GPU memory <b data-f="gpu"></b></label><div class="track"><i data-f="gpuBar" style="background:var(--gpu)"></i></div></div>
+      <div class="meter"><label>CPU memory <b data-f="cpu"></b></label><div class="track"><i data-f="cpuBar" style="background:var(--cpu)"></i></div></div>
+      <div class="meter blocks"><label>Where the blocks are <b data-f="blocks"></b></label><div class="track" data-f="stack"></div>
+        <div class="legend"><span><i style="background:var(--gpu)"></i>GPU</span><span><i style="background:var(--comp)"></i>GPU, compressed</span><span><i style="background:var(--cpu)"></i>CPU</span><span><i style="background:var(--ink3)"></i>CPU, compressed</span><span><i style="background:var(--line)"></i>Evicted</span></div></div>
+      <div class="counts"><div><small>Migrate</small><b data-f="mig"></b></div><div><small>Compress</small><b data-f="cmp"></b></div><div><small>Evict</small><b data-f="evi"></b></div><div><small>Requests</small><b data-f="req"></b></div></div>
+    </article>`;
+  }).join("");
+  const rows = runs.map((r, k) => {
+    const s = r.summary; const c = k === 0 ? "var(--base)" : "var(--ours)";
+    return `<tr><td><span class="dot" style="background:${c}"></span> ${k===0?"LRU + offload":"Adaptive engine"}</td><td>${s.reuse_ttft_mean_ms.toFixed(1)} ms</td><td>${s.reuse_ttft_p50_ms.toFixed(1)} ms</td><td>${s.reuse_ttft_p99_ms.toFixed(0)} ms</td><td>${(s.gpu_hit_ratio*100).toFixed(1)}%</td><td>${(s.recompute_ratio*100).toFixed(1)}%</td><td>${(s.compressed_read_ratio*100).toFixed(1)}%</td></tr>`;
+  }).join("");
+  const b = runs[0].summary.reuse_ttft_mean_ms, o = runs[1].summary.reuse_ttft_mean_ms, d = (o - b) / b * 100;
+  $("results").innerHTML = `<thead><tr><th>Policy</th><th>TTFT mean</th><th>P50</th><th>P99</th><th>Served from GPU</th><th>Recomputed</th><th>Read compressed</th></tr></thead><tbody>${rows}</tbody>
+    <tfoot><tr><td><b>Change in mean TTFT</b></td><td colspan="6" style="text-align:left"><b>${d>0?"+":""}${d.toFixed(1)}%</b> (${d<=0?"faster":"slower"} than the baseline)</td></tr></tfoot>`;
+  $("caveat").textContent = `Part of the speed-up comes from reading ${(runs[1].summary.compressed_read_ratio*100).toFixed(0)}% of blocks from compressed, lossy data. The accuracy cost of that is not measured in simulation; it needs a real model.`;
+  $("scenarioNote").textContent = DATA.scenarios[scen].note;
+  const n = runs[0].frames.length;
+  $("scrub").max = n - 1; idx = Math.min(idx, n - 1);
+  drawChart();
+  render();
+}
+
+function f(el, p, name) { return el.querySelector(`[data-f="${name}"]`); }
+function render() {
+  const sc = DATA.scenarios[scen], runs = sc.runs;
+  document.querySelectorAll(".panel").forEach((el) => {
+    const k = +el.dataset.k, run = runs[k], fr = run.frames[idx];
+    f(el,0,"gpu").textContent = `${fr.gpu_used_mb.toFixed(0)} / ${run.gpu_capacity_mb.toFixed(0)} MB`;
+    f(el,0,"gpuBar").style.width = Math.min(100, fr.gpu_used_mb / run.gpu_capacity_mb * 100) + "%";
+    f(el,0,"cpu").textContent = `${fr.cpu_used_mb.toFixed(0)} / ${run.cpu_capacity_mb.toFixed(0)} MB`;
+    f(el,0,"cpuBar").style.width = Math.min(100, fr.cpu_used_mb / run.cpu_capacity_mb * 100) + "%";
+    const parts = [[fr.gpu_blocks - fr.gpu_compressed, "var(--gpu)"],[fr.gpu_compressed,"var(--comp)"],[fr.cpu_blocks - fr.cpu_compressed,"var(--cpu)"],[fr.cpu_compressed,"var(--ink3)"],[fr.evicted_blocks,"var(--line)"]];
+    const total = parts.reduce((a,p)=>a+p[0],0) || 1;
+    f(el,0,"stack").innerHTML = parts.map(p => `<i style="width:${p[0]/total*100}%;background:${p[1]}"></i>`).join("");
+    f(el,0,"blocks").textContent = `${(fr.gpu_blocks+fr.cpu_blocks).toLocaleString()} cached`;
+    f(el,0,"mig").textContent = fr.migrations.toLocaleString();
+    f(el,0,"cmp").textContent = fr.compressions.toLocaleString();
+    f(el,0,"evi").textContent = fr.evictions.toLocaleString();
+    f(el,0,"req").textContent = fr.requests.toLocaleString();
+  });
+  const t = runs[0].frames[idx].t;
+  $("clock").textContent = `${t.toFixed(0)} s / ${runs[0].duration_s.toFixed(0)} s`;
+  $("scrub").value = idx;
+  const acts = runs[1].actions.filter(a => a.t <= t).slice(-7).reverse();
+  $("log").innerHTML = acts.length ? acts.map(a => `<div>t=${a.t.toFixed(2)}s <b>${a.action}</b> ${a.block} frees ${a.freed_mb.toFixed(2)} MB${a.fallback ? " (fallback: " + a.fallback + ")" : ""}</div>`).join("") : "<div>No decisions yet: the GPU has not filled up.</div>";
+  moveCursor();
+}
+
+let chartGeom = null;
+function smooth(frames, w) {
+  return frames.map((_, i) => { let s = 0, n = 0; for (let j = Math.max(0, i - w + 1); j <= i; j++) { if (frames[j].ttft_recent_ms != null) { s += frames[j].ttft_recent_ms; n++; } } return n ? s / n : null; });
+}
+function drawChart() {
+  const runs = DATA.scenarios[scen].runs, W = 900, H = 260, m = {l: 48, r: 110, t: 12, b: 30};
+  const series = runs.map(r => smooth(r.frames, 5));
+  const all = series.flat().filter(v => v != null).sort((a,b)=>a-b);
+  const top = Math.max(5, all[Math.floor(all.length * 0.98)] * 1.1);
+  const tmax = runs[0].frames.length - 1;
+  const x = (i) => m.l + (W - m.l - m.r) * i / tmax, y = (v) => H - m.b - (H - m.t - m.b) * Math.min(v, top) / top;
+  const step = top > 100 ? 50 : top > 40 ? 20 : top > 15 ? 5 : 2;
+  let g = "";
+  for (let v = 0; v <= top; v += step) g += `<line x1="${m.l}" x2="${W-m.r}" y1="${y(v)}" y2="${y(v)}" stroke="${css('--grid')}"/><text x="${m.l-6}" y="${y(v)+4}" text-anchor="end">${v}</text>`;
+  const ts = runs[0].frames.map(f => f.t);
+  for (let s = 0; s <= ts[tmax]; s += 20) { const i = ts.findIndex(v => v >= s); if (i >= 0) g += `<text x="${x(i)}" y="${H-10}" text-anchor="middle">${s}s</text>`; }
+  g += `<text x="${m.l}" y="9" style="font-size:11px">ms</text>`;
+  const cols = [css('--base'), css('--ours')], names = ["LRU + offload", "Adaptive engine"];
+  series.forEach((s, k) => {
+    let d = "", pen = false;
+    s.forEach((v, i) => { if (v == null) { pen = false; return; } d += (pen ? "L" : "M") + x(i).toFixed(1) + " " + y(v).toFixed(1); pen = true; });
+    g += `<path d="${d}" fill="none" stroke="${cols[k]}" stroke-width="2" stroke-linejoin="round"/>`;
+    const lastV = [...s].reverse().find(v => v != null);
+    if (lastV != null) g += `<text x="${W-m.r+6}" y="${y(lastV)+(k===0?-4:12)}" style="fill:${cols[k]};font-weight:600">${names[k]}</text>`;
+  });
+  g += `<line id="cursor" y1="${m.t}" y2="${H-m.b}" stroke="${css('--ink')}" stroke-width="1" stroke-dasharray="3 3"/>`;
+  $("chart").innerHTML = g;
+  chartGeom = {x, tmax, m, W};
+}
+function moveCursor() { const c = $("cursor"); if (c && chartGeom) { const px = chartGeom.x(idx); c.setAttribute("x1", px); c.setAttribute("x2", px); } }
+function seekFromEvent(e) {
+  const svg = $("chart"), r = svg.getBoundingClientRect(), vx = (e.clientX - r.left) / r.width * chartGeom.W;
+  const frac = (vx - chartGeom.m.l) / (chartGeom.W - chartGeom.m.l - chartGeom.m.r);
+  idx = Math.max(0, Math.min(chartGeom.tmax, Math.round(frac * chartGeom.tmax))); render();
+}
+let dragging = false;
+$("chart").addEventListener("pointerdown", (e) => { dragging = true; $("chart").setPointerCapture(e.pointerId); seekFromEvent(e); });
+$("chart").addEventListener("pointermove", (e) => { if (dragging) seekFromEvent(e); });
+$("chart").addEventListener("pointerup", () => { dragging = false; });
+
+$("scrub").addEventListener("input", (e) => { idx = +e.target.value; render(); });
+$("play").addEventListener("click", () => { if (!playing && idx >= DATA.scenarios[scen].runs[0].frames.length - 1) idx = 0; setPlaying(!playing); });
+function setPlaying(p) { playing = p; $("play").textContent = p ? "Pause" : "Play"; }
+$("speeds").addEventListener("click", (e) => { const b = e.target.closest("button"); if (!b) return; speed = +b.dataset.s; [...$("speeds").children].forEach(c => c.setAttribute("aria-pressed", c === b)); });
+$("scenarios").addEventListener("click", (e) => { const b = e.target.closest("button"); if (!b) return; scen = +b.dataset.i; idx = 0; [...$("scenarios").children].forEach(c => c.setAttribute("aria-pressed", c === b)); setPlaying(true); buildPanels(); });
+
+const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+if (reduce) { setPlaying(false); }
+function tick(ts) {
+  if (playing) {
+    acc += (ts - last) / 1000 * speed; last = ts;
+    const n = DATA.scenarios[scen].runs[0].frames.length;
+    while (acc >= 1) { acc -= 1; if (idx < n - 1) idx++; else { setPlaying(false); break; } }
+    render();
+  } else last = ts;
+  requestAnimationFrame(tick);
+}
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => { drawChart(); render(); });
+buildPanels();
+if (reduce) { idx = DATA.scenarios[scen].runs[0].frames.length - 1; render(); }
+requestAnimationFrame((ts) => { last = ts; tick(ts); });
+</script>

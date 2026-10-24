@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adaptive-kv-cache-manager"
+version = "0.3.0"
+description = "Cost-benefit multi-tier KV cache management for LLM serving (simulation, evaluation and demo)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []  # the core and the simulator use only the standard library
+
+[project.optional-dependencies]
+plots = ["matplotlib>=3.7"]
+dev = ["ruff>=0.5", "mypy>=1.10", "matplotlib>=3.7"]
+
+[project.scripts]
+kv-demo = "src.demo:main"
+kv-experiment = "src.experiment:main"
+kv-analysis = "src.analysis:main"
+kv-plots = "src.plots:main"
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+check_untyped_defs = true

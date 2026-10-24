@@ -22,7 +22,7 @@ python -m src.experiment --seeds 3        # event-driven experiment, all workloa
 python -m src.analysis results/full_host_starved.json   # paired statistics on saved results
 ```
 
-Requires Python 3.9+. Runs are deterministic.
+Requires Python 3.10+. Runs are deterministic.
 
 ## Status
 
